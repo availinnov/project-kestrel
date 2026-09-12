@@ -8,6 +8,7 @@ from typing import Any
 from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.project import ProjectParseError, parse_project, project_summary
+from kestrel.project.semantic import semantic_diff_files
 
 
 def render(result: dict[str, Any]) -> str:
@@ -41,6 +42,9 @@ def main() -> None:
     diff_parser.add_argument("left")
     diff_parser.add_argument("right")
     diff_parser.add_argument("--json", action="store_true", help="Output JSON")
+    diff_parser.add_argument(
+        "--semantic", action="store_true", help="Compare meaningful project structure"
+    )
     summary_parser = commands.add_parser(
         "project-summary", help="Summarize a structured project container"
     )
@@ -56,7 +60,11 @@ def main() -> None:
         elif args.command == "project-summary":
             result = project_summary(parse_project(args.path))
         else:
-            result = diff_files(args.left, args.right)
+            result = (
+                semantic_diff_files(args.left, args.right)
+                if args.semantic
+                else diff_files(args.left, args.right)
+            )
     except (OSError, ProjectParseError) as error:
         result = {"error": str(error)}
     print(

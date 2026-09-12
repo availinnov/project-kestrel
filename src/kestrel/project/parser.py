@@ -1,5 +1,6 @@
 """Discover structured documents in ZIP containers without extracting files."""
 
+import base64
 import json
 import math
 import zipfile
@@ -15,6 +16,7 @@ from kestrel.formats.inspect import (
     zip_entries,
 )
 from kestrel.project.models import (
+    COLOR_TAG_PALETTE_ORDER,
     Clip,
     Identifier,
     Project,
@@ -72,6 +74,92 @@ def time_value(raw: Raw, key: str) -> TimeValue | None:
     return value
 
 
+def decode_color_tag(raw: Raw, warnings: list[str]) -> int | None:
+    """Decode a little-endian int32 tag without altering its original user data."""
+    entries = raw.get("userData", [])
+    label = f"Clip {raw.get('thisUId')}: color tag"
+    if not isinstance(entries, list):
+        warnings.append(f"{label}: invalid userData retained")
+        return None
+    matches = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and type(entry.get("key")) is int
+        and entry["key"] == 13000
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        warnings.append(f"{label}: duplicate entries retained; value is ambiguous")
+        return None
+    entry = matches[0]
+    try:
+        if type(entry.get("size")) is not int or entry["size"] != 4:
+            raise ValueError("expected size 4")
+        if not isinstance(entry.get("data"), str):
+            raise ValueError("expected Base64 text")
+        data = base64.b64decode(entry["data"], validate=True)
+        if len(data) != 4:
+            raise ValueError("expected four decoded bytes")
+    except ValueError as error:
+        warnings.append(f"{label}: {error}; raw entry retained")
+        return None
+    value = int.from_bytes(data, byteorder="little", signed=True)
+    if value not in COLOR_TAG_PALETTE_ORDER:
+        warnings.append(f"{label}: unknown numeric value {value} retained")
+    return value
+
+
+def decode_audio_gain(raw: Raw, warnings: list[str]) -> float | None:
+    """Locate VolumeGain by name across effects, retaining all original fields."""
+    matches: list[tuple[str, Raw]] = []
+    label = f"Clip {raw.get('thisUId')}: audio gain"
+    for chain in objects(raw.get("effectChainList", []), "effectChainList"):
+        for effect in objects(chain.get("effectList", []), "effectList"):
+            identity = str(
+                effect.get("id") or effect.get("display") or "unnamed effect"
+            )
+            parameters = effect.get("paramList", [])
+            if not isinstance(parameters, list):
+                warnings.append(
+                    f"{label}: invalid paramList in {identity}; raw retained"
+                )
+                continue
+            for parameter in parameters:
+                if (
+                    isinstance(parameter, dict)
+                    and parameter.get("name") == "VolumeGain"
+                ):
+                    matches.append((identity, parameter))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        identities = ", ".join(identity for identity, _ in matches)
+        warnings.append(f"{label}: ambiguous VolumeGain in {identities}; raw retained")
+        return None
+    identity, parameter = matches[0]
+    fx = parameter.get("fxParam")
+    try:
+        if (
+            not isinstance(fx, dict)
+            or type(fx.get("paramType")) is not int
+            or fx["paramType"] != 2
+        ):
+            raise ValueError("expected fxParam.paramType 2")
+        value = fx.get("unValue")
+        if type(value) not in (int, float):
+            raise ValueError("expected numeric unValue")
+        assert isinstance(value, (int, float))
+        gain = float(value)
+        if not math.isfinite(gain):
+            raise ValueError("expected finite unValue")
+    except (ValueError, OverflowError) as error:
+        warnings.append(f"{label} in {identity}: {error}; raw retained")
+        return None
+    return gain
+
+
 def parse_clip(raw: Raw, warnings: list[str]) -> Clip:
     clip_id = required_id(raw.get("thisUId"), "clip.thisUId")
     transitions = []
@@ -123,6 +211,8 @@ def parse_clip(raw: Raw, warnings: list[str]) -> Clip:
         volume,
         transitions,
         raw,
+        color_tag=decode_color_tag(raw, warnings),
+        audio_gain_db=decode_audio_gain(raw, warnings),
     )
     for begin, end, label in (
         (clip.in_point, clip.out_point, "source range"),

@@ -9,6 +9,8 @@ type Identifier = str | int
 type TimeValue = int | float
 type Raw = dict[str, Any]
 
+COLOR_TAG_PALETTE_ORDER = (1, 2, 3, 4, 5, 6, 7, 13, 8, 9, 10, 11, 12)
+
 
 class RawObject(dict[str, Any]):
     """Dictionary view plus every original pair, including repeated keys."""
@@ -52,6 +54,8 @@ class Clip:
     raw: Raw = field(repr=False)
     resource: Resource | None = field(default=None, repr=False)
     nested_timeline: Timeline | None = field(default=None, repr=False)
+    color_tag: int | None = None
+    audio_gain_db: float | None = None
 
 
 @dataclass
