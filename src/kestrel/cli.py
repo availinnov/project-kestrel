@@ -7,6 +7,7 @@ from typing import Any
 
 from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
+from kestrel.project import ProjectParseError, parse_project, project_summary
 
 
 def render(result: dict[str, Any]) -> str:
@@ -40,17 +41,23 @@ def main() -> None:
     diff_parser.add_argument("left")
     diff_parser.add_argument("right")
     diff_parser.add_argument("--json", action="store_true", help="Output JSON")
+    summary_parser = commands.add_parser(
+        "project-summary", help="Summarize a structured project container"
+    )
+    summary_parser.add_argument("path")
+    summary_parser.add_argument("--json", action="store_true", help="Output JSON")
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
         return
     try:
-        result = (
-            inspect_file(args.path)
-            if args.command == "inspect"
-            else diff_files(args.left, args.right)
-        )
-    except OSError as error:
+        if args.command == "inspect":
+            result = inspect_file(args.path)
+        elif args.command == "project-summary":
+            result = project_summary(parse_project(args.path))
+        else:
+            result = diff_files(args.left, args.right)
+    except (OSError, ProjectParseError) as error:
         result = {"error": str(error)}
     print(
         json.dumps(result, ensure_ascii=True, indent=2) if args.json else render(result)
