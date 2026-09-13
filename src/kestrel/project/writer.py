@@ -156,6 +156,7 @@ def write_copy(
 
 
 def gain_target(clip: Clip) -> tuple[Raw, list[Raw]] | None:
+    """Prefer an existing parameter, then the exact experimentally verified ID."""
     existing: list[tuple[Raw, list[Raw]]] = []
     capable: list[tuple[Raw, list[Raw]]] = []
     for chain in objects(clip.raw.get("effectChainList", []), "effectChainList"):
@@ -166,12 +167,7 @@ def gain_target(clip: Clip) -> tuple[Raw, list[Raw]] | None:
                 raise ProjectWriteError("Duplicate VolumeGain parameters are ambiguous")
             if matches:
                 existing.append((effect, params))
-            identities = [effect.get("id"), effect.get("display")]
-            if any(
-                isinstance(value, str)
-                and value.rsplit("/", 1)[-1].casefold() in {"clip_volume", "volume"}
-                for value in identities
-            ):
+            if effect.get("id") == "audio/effect/volume":
                 capable.append((effect, params))
     candidates = existing or capable
     if len(candidates) > 1:
@@ -254,6 +250,64 @@ def seconds_to_ticks(value: str | float) -> int:
         raise ProjectWriteError("Invalid trim value") from error
 
 
+def validate_ordinary_speed_parameter(speed: Raw, source_end_seconds: float) -> None:
+    """Accept only the observed constant unit-speed boundary representation."""
+    if "speedParam" not in speed:
+        return
+    encoded = speed["speedParam"]
+    if not isinstance(encoded, str):
+        raise ProjectWriteError("Unsupported speed parameter encoding")
+    try:
+        parameter = parse_json(encoded.encode())
+    except (ValueError, RecursionError) as error:
+        raise ProjectWriteError("Malformed speed parameters") from error
+
+    def finite_number(value: Any) -> bool:
+        if type(value) not in (int, float):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
+    if (
+        not isinstance(parameter, dict)
+        or set(parameter)
+        != {"Version", "ParameterType", "keyframeSets", "MD5", "_totalTime"}
+        or type(parameter["Version"]) is not int
+        or parameter["Version"] != 3
+        or type(parameter["ParameterType"]) is not int
+        or parameter["ParameterType"] != 0
+        or not isinstance(parameter["MD5"], str)
+        or not parameter["MD5"]
+    ):
+        raise ProjectWriteError("Unknown speed parameter structure")
+    total = parameter["_totalTime"]
+    frames = parameter["keyframeSets"]
+    if (
+        not finite_number(total)
+        or total <= 0
+        or total < source_end_seconds
+        or not isinstance(frames, list)
+        or len(frames) != 2
+    ):
+        raise ProjectWriteError("Unsupported speed span or keyframe count")
+    for frame, time in zip(frames, (0, total), strict=True):
+        if (
+            not isinstance(frame, dict)
+            or set(frame) != {"_time", "Interpolation", "_value"}
+            or not finite_number(frame["_time"])
+            or frame["_time"] != time
+            or type(frame["Interpolation"]) is not int
+            or frame["Interpolation"] != 6
+            or not finite_number(frame["_value"])
+            or frame["_value"] != 1
+        ):
+            raise ProjectWriteError(
+                "Speed ramps or unknown keyframe structures are unsupported"
+            )
+
+
 def set_trim(
     source: str | Path,
     output: str | Path,
@@ -313,21 +367,7 @@ def set_trim(
             or speed["offsetEnd"] != clip.out_point / TICKS_PER_SECOND
         ):
             raise ProjectWriteError("Speed offsets do not match the source range")
-        if speed.get("speedParam"):
-            if not isinstance(speed["speedParam"], str):
-                raise ProjectWriteError("Unsupported speed parameter encoding")
-            try:
-                parameter = parse_json(speed["speedParam"].encode())
-            except (ValueError, RecursionError) as error:
-                raise ProjectWriteError("Malformed speed parameters") from error
-            if (
-                not isinstance(parameter, dict)
-                or parameter.get("keyframeSets")
-                or "_totalTime" in parameter
-            ):
-                raise ProjectWriteError(
-                    "Speed keyframes are not supported by this experiment"
-                )
+        validate_ordinary_speed_parameter(speed, clip.out_point / TICKS_PER_SECOND)
         path = object_path(project.raw_documents[timeline.document], clip.raw)
         for key, value in {
             "inPoint": new_in,

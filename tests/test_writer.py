@@ -1,6 +1,7 @@
 """Synthetic copy-only writer experiments and preservation checks."""
 
 import copy
+import json
 import subprocess
 import zipfile
 from pathlib import Path
@@ -9,7 +10,13 @@ from typing import Any
 import pytest
 
 from kestrel.project import parse_project
-from kestrel.project.writer import ProjectWriteError, set_audio_gain, set_trim
+from kestrel.project.parser import parse_clip
+from kestrel.project.writer import (
+    ProjectWriteError,
+    gain_target,
+    set_audio_gain,
+    set_trim,
+)
 from tests.test_audio_gain import gain_clip
 from tests.test_project import container, document
 
@@ -18,7 +25,9 @@ def gain_source(tmp_path: Path, *, missing: bool = False) -> Path:
     doc = document()
     clip = gain_clip(0)
     if missing:
-        clip["effectChainList"][0]["effectList"][1]["paramList"].pop()
+        effect = clip["effectChainList"][0]["effectList"][1]
+        effect["paramList"].pop()
+        effect.update(id="audio/effect/volume", display="volume")
     second = copy.deepcopy(clip)
     second["thisUId"] = "second-audio"
     doc["timelineInfos"][0]["trackInfos"][0]["clipList"] = [clip, second]
@@ -276,3 +285,219 @@ def test_writer_cli(tmp_path: Path, operation: str) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "validated: True" in result.stdout
     assert output.exists()
+
+
+def controlled_audio_clip() -> dict[str, Any]:
+    """Reproduce observed effect identities with entirely synthetic content."""
+    raw = gain_clip(0)
+    raw["effectChainList"] = [
+        {"name": "Basic", "effectList": []},
+        {
+            "name": "BasicFollow",
+            "effectList": [
+                {
+                    "id": f"audio/effect/{name}",
+                    "display": name,
+                    "thisUId": f"synthetic-{name}",
+                    "unknown": {"retain": True},
+                }
+                for name in (
+                    "clip_volume",
+                    "change_channel",
+                    "volume",
+                    "ducking",
+                    "fade",
+                    "equalizer",
+                )
+            ],
+        },
+        {"name": "Effect", "effectList": []},
+    ]
+    return raw
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_controlled_gain_target_and_copy(tmp_path: Path, reverse: bool) -> None:
+    raw = controlled_audio_clip()
+    if reverse:
+        raw["effectChainList"][1]["effectList"].reverse()
+        raw["effectChainList"].reverse()
+    target = gain_target(parse_clip(raw, []))
+    assert target is not None
+    assert target[0]["id"] == "audio/effect/volume"
+    assert target[0]["display"] == "volume"
+    doc = document()
+    doc["timelineInfos"][0]["trackInfos"][0]["clipList"] = [raw]
+    source = container(tmp_path, doc)
+    original = source.read_bytes()
+    output = tmp_path / "modified.zip"
+    assert set_audio_gain(source, output, -6)["validated"]
+    project = parse_project(output)
+    assert project.active_timeline is not None
+    clip = project.active_timeline.tracks[0].clips[0]
+    assert clip.audio_gain_db == -6.0
+    expected = copy.deepcopy(raw)
+    for chain in expected["effectChainList"]:
+        for effect in chain["effectList"]:
+            if effect["id"] == "audio/effect/volume":
+                effect["paramList"] = [
+                    {"name": "VolumeGain", "fxParam": {"paramType": 2, "unValue": -6.0}}
+                ]
+    assert clip.raw == expected
+    assert source.read_bytes() == original
+
+
+def test_existing_gain_wins_over_known_fallback() -> None:
+    raw = controlled_audio_clip()
+    effects = raw["effectChainList"][1]["effectList"]
+    effects[0]["paramList"] = [
+        {"name": "VolumeGain", "fxParam": {"paramType": 2, "unValue": 3.0}}
+    ]
+    # Even duplicated fallback identities cannot supersede the existing parameter.
+    effects.append(copy.deepcopy(effects[2]))
+    target = gain_target(parse_clip(raw, []))
+    assert target is not None and target[0] is effects[0]
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"id": "audio/effect/clip_volume", "display": "clip_volume"},
+        {"id": "other/effect/volume", "display": "volume"},
+        {"display": "volume"},
+    ],
+)
+def test_gain_fallback_requires_exact_id(identity: dict[str, str]) -> None:
+    raw = controlled_audio_clip()
+    raw["effectChainList"] = [{"effectList": [identity]}]
+    assert gain_target(parse_clip(raw, [])) is None
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_gain_ambiguous_exact_targets_rejected(existing: bool) -> None:
+    raw = controlled_audio_clip()
+    effects = raw["effectChainList"][1]["effectList"]
+    if existing:
+        effects[2]["paramList"] = [
+            {"name": "VolumeGain", "fxParam": {"paramType": 2, "unValue": -6.0}}
+        ]
+    effects.append(copy.deepcopy(effects[2]))
+    with pytest.raises(ProjectWriteError, match="ambiguous"):
+        gain_target(parse_clip(raw, []))
+
+
+def ordinary_speed_parameter() -> dict[str, Any]:
+    """Synthetic values using the observed two-boundary constant-speed schema."""
+    return {
+        "Version": 3,
+        "ParameterType": 0,
+        "keyframeSets": [
+            {"_time": 0.0, "Interpolation": 6, "_value": 1.0},
+            {"_time": 20.0, "Interpolation": 6, "_value": 1.0},
+        ],
+        "MD5": "synthetic-opaque-checksum",
+        "_totalTime": 20.0,
+    }
+
+
+def speed_source(tmp_path: Path, parameter: Any) -> Path:
+    source = trim_source(tmp_path)
+    project = parse_project(source)
+    assert project.active_timeline is not None
+    timeline = project.active_timeline
+    for track in timeline.tracks:
+        track.clips[0].raw["speed"]["speedParam"] = json.dumps(parameter, indent=2)
+    with zipfile.ZipFile(source, "w") as archive:
+        for name, data in project.raw_entries.items():
+            if name == timeline.document:
+                data = json.dumps(project.raw_documents[name]).encode()
+            archive.writestr(name, data)
+    return source
+
+
+@pytest.mark.parametrize(("left", "right"), [(1, 0), (0, 1), (1, 1)])
+def test_ordinary_speed_trim_preserves_parameter(
+    tmp_path: Path, left: int, right: int
+) -> None:
+    source = speed_source(tmp_path, ordinary_speed_parameter())
+    before = parse_project(source)
+    original = source.read_bytes()
+    output = tmp_path / "trimmed.zip"
+    set_trim(source, output, left, right)
+    after = parse_project(output)
+    assert before.active_timeline is not None and after.active_timeline is not None
+    for old_track, new_track in zip(
+        before.active_timeline.tracks, after.active_timeline.tracks, strict=True
+    ):
+        old, new = old_track.clips[0], new_track.clips[0]
+        assert new.raw["speed"]["speedParam"] == old.raw["speed"]["speedParam"]
+        assert new.raw["speed"]["offset"] == 2 + left
+        assert new.raw["speed"]["offsetEnd"] == 12 - right
+        assert new.in_point == (2 + left) * 10_000_000
+        assert new.out_point == (12 - right) * 10_000_000
+        assert new.end == (10 - left - right) * 10_000_000
+    assert source.read_bytes() == original
+    # The unchanged source-span parameter must also support a subsequent trim.
+    set_trim(output, tmp_path / "trimmed-again.zip", 0, 1)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "ramp",
+        "constant_nonunit",
+        "interior_keyframe",
+        "interpolation",
+        "start_time",
+        "end_time",
+        "short_total",
+        "extra_field",
+        "extra_frame_field",
+        "version",
+        "parameter_type",
+        "missing_total",
+        "empty_frames",
+        "boolean_value",
+        "not_object",
+    ],
+)
+def test_unknown_or_varying_speed_rejected(tmp_path: Path, variant: str) -> None:
+    parameter = ordinary_speed_parameter()
+    frames = parameter["keyframeSets"]
+    if variant == "ramp":
+        frames[1]["_value"] = 2.0
+    elif variant == "constant_nonunit":
+        frames[0]["_value"] = frames[1]["_value"] = 0.5
+    elif variant == "interior_keyframe":
+        frames.insert(1, {"_time": 5.0, "Interpolation": 6, "_value": 1.0})
+    elif variant == "interpolation":
+        frames[1]["Interpolation"] = 1
+    elif variant == "start_time":
+        frames[0]["_time"] = 1.0
+    elif variant == "end_time":
+        frames[1]["_time"] = 19.0
+    elif variant == "short_total":
+        parameter["_totalTime"] = frames[1]["_time"] = 10.0
+    elif variant == "extra_field":
+        parameter["unknown"] = 1
+    elif variant == "extra_frame_field":
+        frames[0]["tangent"] = 1
+    elif variant == "version":
+        parameter["Version"] = 4
+    elif variant == "parameter_type":
+        parameter["ParameterType"] = 1
+    elif variant == "missing_total":
+        del parameter["_totalTime"]
+    elif variant == "empty_frames":
+        parameter["keyframeSets"] = []
+    elif variant == "boolean_value":
+        frames[0]["_value"] = True
+    elif variant == "not_object":
+        parameter = {}
+    source = speed_source(tmp_path, parameter)
+    original = source.read_bytes()
+    output = tmp_path / "rejected.zip"
+    with pytest.raises(ProjectWriteError):
+        set_trim(source, output, 1, 0)
+    assert not output.exists()
+    assert source.read_bytes() == original
