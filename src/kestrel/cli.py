@@ -9,6 +9,7 @@ from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.project import ProjectParseError, parse_project, project_summary
 from kestrel.project.semantic import semantic_diff_files
+from kestrel.project.writer import ProjectWriteError, set_audio_gain, set_trim
 
 
 def render(result: dict[str, Any]) -> str:
@@ -50,6 +51,28 @@ def main() -> None:
     )
     summary_parser.add_argument("path")
     summary_parser.add_argument("--json", action="store_true", help="Output JSON")
+    gain_parser = commands.add_parser(
+        "project-set-audio-gain", help="Write a copy with one audio gain change"
+    )
+    gain_parser.add_argument("input")
+    gain_parser.add_argument("output")
+    gain_parser.add_argument("--db", type=float, required=True)
+    trim_parser = commands.add_parser(
+        "project-set-trim", help="Write a trimmed single-source project copy"
+    )
+    trim_parser.add_argument("input")
+    trim_parser.add_argument("output")
+    trim_parser.add_argument(
+        "--left-seconds",
+        required=True,
+        help="Amount removed from the current source start",
+    )
+    trim_parser.add_argument(
+        "--right-seconds",
+        required=True,
+        help="Amount removed from the current source end",
+    )
+    parser.set_defaults(json=False)
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
@@ -59,13 +82,19 @@ def main() -> None:
             result = inspect_file(args.path)
         elif args.command == "project-summary":
             result = project_summary(parse_project(args.path))
+        elif args.command == "project-set-audio-gain":
+            result = set_audio_gain(args.input, args.output, args.db)
+        elif args.command == "project-set-trim":
+            result = set_trim(
+                args.input, args.output, args.left_seconds, args.right_seconds
+            )
         else:
             result = (
                 semantic_diff_files(args.left, args.right)
                 if args.semantic
                 else diff_files(args.left, args.right)
             )
-    except (OSError, ProjectParseError) as error:
+    except (OSError, ProjectParseError, ProjectWriteError) as error:
         result = {"error": str(error)}
     print(
         json.dumps(result, ensure_ascii=True, indent=2) if args.json else render(result)
