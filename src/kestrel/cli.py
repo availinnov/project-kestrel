@@ -100,7 +100,7 @@ def main() -> None:
     )
     clone_parser = commands.add_parser(
         "project-clone-video-track",
-        help="Write a copy with one disabled source clip on a new track",
+        help="Write a disabled source clone on a compatible or new track",
     )
     clone_parser.add_argument("input")
     clone_parser.add_argument("output")

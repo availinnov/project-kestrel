@@ -5,6 +5,7 @@ import json
 import subprocess
 import zipfile
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -86,6 +87,8 @@ def test_clone_success_and_exact_preservation(tmp_path: Path) -> None:
     assert before.active_timeline is not None and after.active_timeline is not None
     old, new = before.active_timeline, after.active_timeline
     assert report["validated"]
+    assert report["reused_existing_track"] is False
+    assert report["target_track_id"] == new.tracks[-1].id
     assert (report["original_track_count"], report["generated_track_count"]) == (2, 3)
     assert len(new.tracks) == len(old.tracks) + 1
     assert [t.raw for t in new.tracks[:-1]] == [t.raw for t in old.tracks]
@@ -214,3 +217,156 @@ def test_clone_cli(tmp_path: Path) -> None:
     assert "original_track_count: 2" in result.stdout
     assert "generated_track_count: 3" in result.stdout
     assert "validated: True" in result.stdout
+
+
+def destination_track(
+    identity: str, interval: tuple[int, int] | None = None, unsupported: str = ""
+) -> dict[str, Any]:
+    clips: list[dict[str, Any]] = []
+    if interval is not None:
+        begin, end = interval
+        clip: dict[str, Any] = {
+            "thisUId": f"existing-{identity}",
+            "type": 1,
+            "sourceUuid": "source-a",
+            "inPoint": 0,
+            "outPoint": max(end - begin, 1),
+            "tlBegin": begin,
+            "tlEnd": end,
+            "unknown": {"retain": [3, 4]},
+        }
+        if unsupported == "transition":
+            clip["postTransition"] = {"type": 5}
+        elif unsupported == "nested":
+            clip["type"] = 7
+            clip["timelineId"] = 999
+        elif unsupported == "missing_end":
+            del clip["tlEnd"]
+        clips.append(clip)
+    return {
+        "uuid": identity,
+        "trackType": 1,
+        "clipList": clips,
+        "unknown_track": {"settings": [9]},
+        "busUuids": ["existing-bus"],
+    }
+
+
+def source_with_destinations(tmp_path: Path, tracks: list[dict[str, Any]]) -> Path:
+    source = clone_source(tmp_path)
+    project = parse_project(source)
+    assert project.active_timeline is not None
+    timeline = project.active_timeline
+    timeline.raw["trackInfos"].extend(tracks)
+    with zipfile.ZipFile(source, "w") as archive:
+        for name, data in project.raw_entries.items():
+            if name == timeline.document:
+                data = json.dumps(project.raw_documents[name], indent=2).encode()
+            archive.writestr(name, data)
+    return source
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [None, (-100_000_000, 0), (100_000_000, 200_000_000), (150_000_000, 250_000_000)],
+)
+def test_reuse_compatible_track(
+    tmp_path: Path, interval: tuple[int, int] | None
+) -> None:
+    source = source_with_destinations(
+        tmp_path, [destination_track("reuse-me", interval)]
+    )
+    before = parse_project(source)
+    original = source.read_bytes()
+    output = tmp_path / "reused.zip"
+    report = clone_video_track(source, output)
+    after = parse_project(output)
+    assert before.active_timeline is not None and after.active_timeline is not None
+    old, new = before.active_timeline, after.active_timeline
+    assert report["reused_existing_track"] is True
+    assert report["target_track_id"] == "reuse-me"
+    assert report["original_track_count"] == report["generated_track_count"] == 3
+    assert [t.raw for t in new.tracks[:2]] == [t.raw for t in old.tracks[:2]]
+    assert new.tracks[2].raw == {
+        **old.tracks[2].raw,
+        "clipList": [*old.tracks[2].raw["clipList"], new.tracks[2].clips[-1].raw],
+    }
+    clone = new.tracks[2].clips[-1]
+    assert clone.raw["enable"] is False
+    assert clone.source_id == old.tracks[0].clips[0].source_id
+    assert (clone.begin, clone.end, clone.in_point, clone.out_point) == (
+        0,
+        100_000_000,
+        20_000_000,
+        120_000_000,
+    )
+    assert all(
+        item["field"] != "track.uuid" for item in report["generated_identity_fields"]
+    )
+    assert sum(c.id == clone.id for t in new.tracks for c in t.clips) == 1
+    assert sum(c.type == 2 for t in new.tracks for c in t.clips) == 1
+    insertion = (
+        ("," if old.tracks[2].clips else "")
+        + json.dumps(clone.raw, ensure_ascii=True, allow_nan=False)
+    ).encode()
+    assert (
+        after.raw_entries[new.document].replace(insertion, b"", 1)
+        == before.raw_entries[old.document]
+    )
+    for name, data in before.raw_entries.items():
+        if name != old.document:
+            assert after.raw_entries[name] == data
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize("alternative", [False, True])
+@pytest.mark.parametrize(
+    "interval", [(0, 50_000_000), (50_000_000, 150_000_000), (-1, 100_000_001)]
+)
+def test_overlap_uses_alternative_or_fallback(
+    tmp_path: Path, alternative: bool, interval: tuple[int, int]
+) -> None:
+    tracks = [destination_track("occupied", interval)]
+    if alternative:
+        tracks.append(destination_track("available"))
+    source = source_with_destinations(tmp_path, tracks)
+    output = tmp_path / "result.zip"
+    before = parse_project(source)
+    report = clone_video_track(source, output)
+    after = parse_project(output)
+    assert report["reused_existing_track"] is alternative
+    assert report["target_track_id"] != "occupied"
+    if alternative:
+        assert report["target_track_id"] == "available"
+    assert report["generated_track_count"] == report["original_track_count"] + (
+        not alternative
+    )
+    assert before.active_timeline is not None and after.active_timeline is not None
+    assert before.active_timeline.tracks[2].raw == after.active_timeline.tracks[2].raw
+
+
+def test_reuse_follows_timeline_order(tmp_path: Path) -> None:
+    source = source_with_destinations(
+        tmp_path, [destination_track("z-first"), destination_track("a-second")]
+    )
+    output = tmp_path / "result.zip"
+    report = clone_video_track(source, output)
+    assert report["target_track_id"] == "z-first"
+    assert report["original_track_count"] == report["generated_track_count"] == 4
+    before, after = parse_project(source), parse_project(output)
+    assert before.active_timeline is not None and after.active_timeline is not None
+    assert before.active_timeline.tracks[3].raw == after.active_timeline.tracks[3].raw
+
+
+@pytest.mark.parametrize("unsupported", ["transition", "nested", "missing_end"])
+def test_unsupported_destination_is_skipped(tmp_path: Path, unsupported: str) -> None:
+    source = source_with_destinations(
+        tmp_path,
+        [
+            destination_track("unsupported", (150_000_000, 200_000_000), unsupported),
+            destination_track("available"),
+        ],
+    )
+    report = clone_video_track(source, tmp_path / "result.zip")
+    assert report["reused_existing_track"] is True
+    assert report["target_track_id"] == "available"

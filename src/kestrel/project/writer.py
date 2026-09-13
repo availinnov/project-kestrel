@@ -15,7 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from kestrel.formats.inspect import parse_json
-from kestrel.project.models import Clip, Identifier, Project, Raw
+from kestrel.project.models import Clip, Identifier, Project, Raw, Track
 from kestrel.project.parser import objects, parse_project
 
 TICKS_PER_SECOND = 10_000_000
@@ -185,7 +185,9 @@ def write_copy(
             temporary.unlink(missing_ok=True)
 
 
-def first_source_pair(project: Project) -> tuple[Clip, Clip]:
+def first_source_pair(
+    project: Project, *, complete_pairs_only: bool = False
+) -> tuple[Clip, Clip]:
     """Select the unique earliest source pair by source and both time ranges."""
     timeline = project.active_timeline
     if timeline is None:
@@ -198,11 +200,19 @@ def first_source_pair(project: Project) -> tuple[Clip, Clip]:
             if clip.resource is None or any(
                 v is None for v in (clip.in_point, clip.out_point, clip.begin, clip.end)
             ):
+                if complete_pairs_only:
+                    continue
                 raise ProjectWriteError(
                     "Source pair has unresolved source or time fields"
                 )
             key = (clip.source_id, clip.in_point, clip.out_point, clip.begin, clip.end)
             groups.setdefault(key, []).append(clip)
+    if complete_pairs_only:
+        groups = {
+            key: clips
+            for key, clips in groups.items()
+            if {c.type for c in clips} == {1, 2}
+        }
     if not groups:
         raise ProjectWriteError("No active-timeline source pair found")
     begin = min(key[3] for key in groups)
@@ -295,20 +305,50 @@ def set_clip_state(
     return write_copy(Path(source), Path(output), project, edits, validate)
 
 
+def compatible_clone_track(track: Track, clip: Clip) -> bool:
+    """Require a supported destination and free space in the half-open interval."""
+    if track.type != 1 or not isinstance(track.raw.get("clipList"), list):
+        return False
+    assert clip.begin is not None and clip.end is not None
+    for existing in track.clips:
+        if (
+            existing.type != 1
+            or existing.nested_timeline_id is not None
+            or existing.resource is None
+            or existing.transitions
+            or existing.begin is None
+            or existing.end is None
+            or existing.begin >= existing.end
+        ):
+            return False
+        if clip.begin < existing.end and existing.begin < clip.end:
+            return False
+    return True
+
+
 def clone_video_track(source: str | Path, output: str | Path) -> dict[str, Any]:
-    """Append a disabled video clone to a new track in a single-pair project."""
+    """Place a disabled video clone on the first compatible track, or a new track."""
     project = parse_project(source)
-    video, audio = first_source_pair(project)
+    # Other tracks may contain unpaired clips; selection still anchors to a source pair.
+    video, audio = first_source_pair(project, complete_pairs_only=True)
     timeline = project.active_timeline
     assert timeline is not None
-    all_clips = [c for track in timeline.tracks for c in track.clips]
-    if len(all_clips) != 2:
-        raise ProjectWriteError("Clone experiment requires a single source pair")
     track = next(t for t in timeline.tracks if any(c is video for c in t.clips))
     if track.type != 1 or len(track.clips) != 1 or video.transitions:
         raise ProjectWriteError(
             "Clone requires a video-only source track without transitions"
         )
+    if video.begin is None or video.end is None or video.begin >= video.end:
+        raise ProjectWriteError("Clone requires a positive timeline interval")
+    destination = next(
+        (
+            t
+            for t in timeline.tracks
+            if t is not track and compatible_clone_track(t, video)
+        ),
+        None,
+    )
+    reused = destination is not None
     # Reserve all existing string values, including IDs in inactive documents.
     reserved: set[str] = set()
     pending: list[Any] = list(project.raw_documents.values())
@@ -343,24 +383,47 @@ def clone_video_track(source: str | Path, output: str | Path) -> dict[str, Any]:
                     effect["thisUId"],
                     f"clip.effectChainList[{ci}].effectList[{ei}].thisUId",
                 )
-    new_track = copy.deepcopy(track.raw)
-    new_track["uuid"] = fresh_id(track.id, "track.uuid")
-    new_track["clipList"] = [new_clip]
     name = timeline.document
-    path = object_path(project.raw_documents[name], timeline.raw)
+    if destination is not None:
+        new_track = {
+            **destination.raw,
+            "clipList": [*destination.raw["clipList"], new_clip],
+        }
+        target_index = next(
+            i for i, t in enumerate(timeline.tracks) if t is destination
+        )
+        path = object_path(project.raw_documents[name], destination.raw)
+        edit: Edit = (name, (*path, "clipList"), JsonAppend([new_clip]))
+    else:
+        new_track = copy.deepcopy(track.raw)
+        new_track["uuid"] = fresh_id(track.id, "track.uuid")
+        new_track["clipList"] = [new_clip]
+        target_index = len(timeline.tracks)
+        path = object_path(project.raw_documents[name], timeline.raw)
+        edit = (name, (*path, "trackInfos"), JsonAppend([new_track]))
+    expected_tracks = [t.raw for t in timeline.tracks]
+    if reused:
+        expected_tracks[target_index] = new_track
+    else:
+        expected_tracks.append(new_track)
 
     def validate(updated: Project) -> None:
         current = updated.active_timeline
         if current is None or current.id != timeline.id or current.document != name:
             raise ProjectWriteError("Post-write active timeline validation failed")
-        if len(current.tracks) != len(timeline.tracks) + 1:
+        if len(current.tracks) != len(expected_tracks):
             raise ProjectWriteError("Post-write track count validation failed")
-        if [t.raw for t in current.tracks[:-1]] != [t.raw for t in timeline.tracks]:
-            raise ProjectWriteError("Post-write original tracks changed")
-        added = current.tracks[-1]
-        if added.type != 1 or added.raw != new_track or len(added.clips) != 1:
+        if [t.raw for t in current.tracks] != expected_tracks:
+            raise ProjectWriteError("Post-write track preservation validation failed")
+        added = current.tracks[target_index]
+        if added.type != 1 or added.raw != new_track:
             raise ProjectWriteError("Post-write cloned track validation failed")
-        clone = added.clips[0]
+        clones = [
+            c for t in current.tracks for c in t.clips if c.id == new_clip["thisUId"]
+        ]
+        if len(clones) != 1:
+            raise ProjectWriteError("Post-write clone uniqueness validation failed")
+        clone = clones[0]
         if (
             clone.id == video.id
             or clone.resource is None
@@ -382,12 +445,14 @@ def clone_video_track(source: str | Path, output: str | Path) -> dict[str, Any]:
         Path(source),
         Path(output),
         project,
-        [(name, (*path, "trackInfos"), JsonAppend([new_track]))],
+        [edit],
         validate,
     )
     result.update(
         original_track_count=len(timeline.tracks),
-        generated_track_count=len(timeline.tracks) + 1,
+        generated_track_count=len(expected_tracks),
+        reused_existing_track=reused,
+        target_track_id=new_track["uuid"],
         original_clip_id=video.id,
         cloned_clip_id=new_clip["thisUId"],
         source_uuid_equal=True,
