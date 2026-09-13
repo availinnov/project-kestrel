@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from kestrel.formats.inspect import parse_json
 from kestrel.project.models import Clip, Identifier, Project, Raw
@@ -292,6 +293,108 @@ def set_clip_state(
             raise ProjectWriteError("Post-write color tag validation failed")
 
     return write_copy(Path(source), Path(output), project, edits, validate)
+
+
+def clone_video_track(source: str | Path, output: str | Path) -> dict[str, Any]:
+    """Append a disabled video clone to a new track in a single-pair project."""
+    project = parse_project(source)
+    video, audio = first_source_pair(project)
+    timeline = project.active_timeline
+    assert timeline is not None
+    all_clips = [c for track in timeline.tracks for c in track.clips]
+    if len(all_clips) != 2:
+        raise ProjectWriteError("Clone experiment requires a single source pair")
+    track = next(t for t in timeline.tracks if any(c is video for c in t.clips))
+    if track.type != 1 or len(track.clips) != 1 or video.transitions:
+        raise ProjectWriteError(
+            "Clone requires a video-only source track without transitions"
+        )
+    # Reserve all existing string values, including IDs in inactive documents.
+    reserved: set[str] = set()
+    pending: list[Any] = list(project.raw_documents.values())
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            reserved.add(value.strip("{}").casefold())
+    identities: list[dict[str, Any]] = []
+
+    def fresh_id(old: Any, field: str) -> str:
+        for _ in range(10):
+            new = str(uuid4())
+            if new.casefold() not in reserved:
+                reserved.add(new.casefold())
+                identities.append({"field": field, "original": old, "generated": new})
+                return new
+        raise ProjectWriteError("Could not allocate a unique object identity")
+
+    new_clip = copy.deepcopy(video.raw)
+    new_clip["thisUId"] = fresh_id(video.id, "clip.thisUId")
+    new_clip["enable"] = False
+    for ci, chain in enumerate(
+        objects(new_clip.get("effectChainList", []), "effectChainList")
+    ):
+        for ei, effect in enumerate(objects(chain.get("effectList", []), "effectList")):
+            if "thisUId" in effect:
+                effect["thisUId"] = fresh_id(
+                    effect["thisUId"],
+                    f"clip.effectChainList[{ci}].effectList[{ei}].thisUId",
+                )
+    new_track = copy.deepcopy(track.raw)
+    new_track["uuid"] = fresh_id(track.id, "track.uuid")
+    new_track["clipList"] = [new_clip]
+    name = timeline.document
+    path = object_path(project.raw_documents[name], timeline.raw)
+
+    def validate(updated: Project) -> None:
+        current = updated.active_timeline
+        if current is None or current.id != timeline.id or current.document != name:
+            raise ProjectWriteError("Post-write active timeline validation failed")
+        if len(current.tracks) != len(timeline.tracks) + 1:
+            raise ProjectWriteError("Post-write track count validation failed")
+        if [t.raw for t in current.tracks[:-1]] != [t.raw for t in timeline.tracks]:
+            raise ProjectWriteError("Post-write original tracks changed")
+        added = current.tracks[-1]
+        if added.type != 1 or added.raw != new_track or len(added.clips) != 1:
+            raise ProjectWriteError("Post-write cloned track validation failed")
+        clone = added.clips[0]
+        if (
+            clone.id == video.id
+            or clone.resource is None
+            or clone.source_id != video.source_id
+            or clone.raw.get("enable") is not False
+            or (clone.in_point, clone.out_point, clone.begin, clone.end)
+            != (video.in_point, video.out_point, video.begin, video.end)
+            or clone.raw.get("speed") != video.raw.get("speed")
+        ):
+            raise ProjectWriteError("Post-write cloned clip validation failed")
+        if current.duration != timeline.duration or [
+            r.raw for r in updated.resources
+        ] != [r.raw for r in project.resources]:
+            raise ProjectWriteError("Post-write duration or resource validation failed")
+        if sum(c.id == audio.id for t in current.tracks for c in t.clips) != 1:
+            raise ProjectWriteError("Post-write audio preservation validation failed")
+
+    result = write_copy(
+        Path(source),
+        Path(output),
+        project,
+        [(name, (*path, "trackInfos"), JsonAppend([new_track]))],
+        validate,
+    )
+    result.update(
+        original_track_count=len(timeline.tracks),
+        generated_track_count=len(timeline.tracks) + 1,
+        original_clip_id=video.id,
+        cloned_clip_id=new_clip["thisUId"],
+        source_uuid_equal=True,
+        timeline_source_range_equal=True,
+        generated_identity_fields=identities,
+    )
+    return result
 
 
 def gain_target(clip: Clip) -> tuple[Raw, list[Raw]] | None:

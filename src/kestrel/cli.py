@@ -11,6 +11,7 @@ from kestrel.project import ProjectParseError, parse_project, project_summary
 from kestrel.project.semantic import semantic_diff_files
 from kestrel.project.writer import (
     ProjectWriteError,
+    clone_video_track,
     set_audio_gain,
     set_clip_state,
     set_trim,
@@ -97,6 +98,12 @@ def main() -> None:
         choices=range(1, 14),
         help="Stored numeric tag (1 through 13)",
     )
+    clone_parser = commands.add_parser(
+        "project-clone-video-track",
+        help="Write a copy with one disabled source clip on a new track",
+    )
+    clone_parser.add_argument("input")
+    clone_parser.add_argument("output")
     parser.set_defaults(json=False)
     args = parser.parse_args()
     if args.command is None:
@@ -117,6 +124,8 @@ def main() -> None:
             result = set_clip_state(
                 args.input, args.output, enable=args.enable, color_tag=args.color_tag
             )
+        elif args.command == "project-clone-video-track":
+            result = clone_video_track(args.input, args.output)
         else:
             result = (
                 semantic_diff_files(args.left, args.right)
