@@ -346,7 +346,9 @@ def semantic_diff(left: Project, right: Project) -> dict[str, Any]:
                     (doc, raw["currentTimelineId"]),
                     {"unresolved": raw["currentTimelineId"]},
                 )
-            if keyed_list(raw.get("resources"), "sourceUuid"):
+            if raw.get("resources") is None:
+                raw["resources"] = {}
+            elif keyed_list(raw.get("resources"), "sourceUuid"):
                 raw["resources"] = {str(r["sourceUuid"]): r for r in raw["resources"]}
         comparisons.append((f"$/documents/{i}", va, vb))
     for path, va, vb in comparisons:

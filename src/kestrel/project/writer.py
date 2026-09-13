@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from kestrel.formats.inspect import parse_json
+from kestrel.formats.inspect import parse_json, safe_entry
 from kestrel.project.models import Clip, Identifier, Project, Raw, Track
 from kestrel.project.parser import objects, parse_project
 
@@ -32,6 +32,45 @@ class JsonAppend:
     """Append members without reserializing existing object or array content."""
 
     value: dict[str, Any] | list[Any]
+
+
+@dataclass
+class JsonRenameKey:
+    """Rename one existing object key while preserving its value bytes."""
+
+    value: str
+
+
+def json_key_span(text: str, path: JsonPath) -> tuple[int, int]:
+    start, _ = json_span(text, path[:-1])
+    if text[start] != "{" or not isinstance(path[-1], str):
+        raise ProjectWriteError("Key rename requires an object member")
+    decoder = json.JSONDecoder()
+    index = start + 1
+    matches = []
+    while True:
+        while text[index].isspace():
+            index += 1
+        if text[index] == "}":
+            break
+        key, end = decoder.raw_decode(text, index)
+        if key == path[-1]:
+            matches.append((index, end))
+        index = end
+        while text[index].isspace():
+            index += 1
+        index += 1
+        while text[index].isspace():
+            index += 1
+        _, index = decoder.raw_decode(text, index)
+        while text[index].isspace():
+            index += 1
+        if text[index] != ",":
+            break
+        index += 1
+    if len(matches) != 1:
+        raise ProjectWriteError("Key rename is absent or ambiguous")
+    return matches[0]
 
 
 def object_path(value: Any, target: Raw, path: JsonPath = ()) -> JsonPath:
@@ -104,7 +143,13 @@ def patched_entries(project: Project, edits: list[Edit]) -> dict[str, bytes]:
         for document, path, value in edits:
             if document == name:
                 start, end = json_span(text, path)
-                if isinstance(value, JsonAppend):
+                if isinstance(value, JsonRenameKey):
+                    parent_start, parent_end = json_span(text, path[:-1])
+                    if value.value in json.loads(text[parent_start:parent_end]):
+                        raise ProjectWriteError("Renamed JSON key already exists")
+                    start, end = json_key_span(text, path)
+                    replacements.append((start, end, json.dumps(value.value)))
+                elif isinstance(value, JsonAppend):
                     current = json.loads(text[start:end])
                     extra = value.value
                     if type(current) is not type(extra) or (
@@ -146,10 +191,20 @@ def write_copy(
     project: Project,
     edits: list[Edit],
     validate: Callable[[Project], None],
+    *,
+    renames: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if source.resolve() == output.resolve() or os.path.lexists(output):
         raise ProjectWriteError("Output must be a new path; overwriting is disabled")
     entries = patched_entries(project, edits)
+    renames = renames or {}
+    if not renames.keys() <= entries.keys() or any(
+        not safe_entry(n) for n in renames.values()
+    ):
+        raise ProjectWriteError("Invalid ZIP entry rename")
+    expected_entries = {renames.get(name, name): data for name, data in entries.items()}
+    if len(expected_entries) != len(entries):
+        raise ProjectWriteError("ZIP entry rename collision")
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -166,9 +221,13 @@ def write_copy(
             for info in original.infolist():
                 if original.read(info) != project.raw_entries[info.filename]:
                     raise ProjectWriteError("Input container changed during editing")
-                generated.writestr(copy.copy(info), entries[info.filename])
+                new_info = copy.copy(info)
+                new_info.filename = new_info.orig_filename = renames.get(
+                    info.filename, info.filename
+                )
+                generated.writestr(new_info, entries[info.filename])
         verified = parse_project(temporary)
-        if verified.raw_entries != entries:
+        if verified.raw_entries != expected_entries:
             raise ProjectWriteError("Post-write entry validation failed")
         validate(verified)
         # Same-directory hard link publishes atomically and refuses an existing target.
@@ -177,7 +236,9 @@ def write_copy(
             "output": str(output),
             "validated": True,
             "modified_entries": sorted(
-                name for name in entries if entries[name] != project.raw_entries[name]
+                renames.get(name, name)
+                for name in entries
+                if entries[name] != project.raw_entries[name]
             ),
         }
     finally:

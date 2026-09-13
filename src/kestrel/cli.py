@@ -9,6 +9,7 @@ from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.project import ProjectParseError, parse_project, project_summary
 from kestrel.project.semantic import semantic_diff_files
+from kestrel.project.template import instantiate_template
 from kestrel.project.writer import (
     ProjectWriteError,
     clone_video_track,
@@ -104,6 +105,16 @@ def main() -> None:
     )
     clone_parser.add_argument("input")
     clone_parser.add_argument("output")
+    template_parser = commands.add_parser(
+        "project-instantiate-template",
+        help="Create a fresh empty project from a template",
+    )
+    template_parser.add_argument("template")
+    template_parser.add_argument("output")
+    template_parser.add_argument("--name", required=True)
+    template_parser.add_argument("--width", type=int)
+    template_parser.add_argument("--height", type=int)
+    template_parser.add_argument("--fps", type=int)
     parser.set_defaults(json=False)
     args = parser.parse_args()
     if args.command is None:
@@ -126,6 +137,15 @@ def main() -> None:
             )
         elif args.command == "project-clone-video-track":
             result = clone_video_track(args.input, args.output)
+        elif args.command == "project-instantiate-template":
+            result = instantiate_template(
+                args.template,
+                args.output,
+                name=args.name,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+            )
         else:
             result = (
                 semantic_diff_files(args.left, args.right)

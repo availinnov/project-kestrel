@@ -289,7 +289,19 @@ def build_project(entries: dict[str, bytes]) -> Project:
     timeline_map: dict[tuple[str, Identifier], Timeline] = {}
     active_candidates: list[Timeline] = []
     for name, doc in structured.items():
-        for raw in objects(doc.get("resources", []), "resources"):
+        resource_data = doc.get("resources", [])
+        if resource_data is None:
+            empty_timelines = objects(doc["timelineInfos"], "timelineInfos")
+            if any(
+                objects(track.get("clipList", []), "clipList")
+                for timeline in empty_timelines
+                for track in objects(timeline.get("trackInfos", []), "trackInfos")
+            ):
+                raise ProjectParseError(
+                    "Null resources are supported only for empty timelines"
+                )
+            resource_data = []
+        for raw in objects(resource_data, "resources"):
             resource_id = required_id(raw.get("sourceUuid"), "resource.sourceUuid")
             if (name, resource_id) in resource_map:
                 raise ProjectParseError(f"Duplicate resource identifier: {resource_id}")
