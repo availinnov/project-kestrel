@@ -1,5 +1,6 @@
 """Conservative copy-only project edits with post-write validation."""
 
+import base64
 import copy
 import json
 import math
@@ -7,6 +8,7 @@ import os
 import tempfile
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,13 @@ type Edit = tuple[str, JsonPath, Any]
 
 class ProjectWriteError(ValueError):
     """The requested edit cannot be made conservatively."""
+
+
+@dataclass
+class JsonAppend:
+    """Append members without reserializing existing object or array content."""
+
+    value: dict[str, Any] | list[Any]
 
 
 def object_path(value: Any, target: Raw, path: JsonPath = ()) -> JsonPath:
@@ -94,9 +103,29 @@ def patched_entries(project: Project, edits: list[Edit]) -> dict[str, bytes]:
         for document, path, value in edits:
             if document == name:
                 start, end = json_span(text, path)
-                replacements.append(
-                    (start, end, json.dumps(value, ensure_ascii=True, allow_nan=False))
-                )
+                if isinstance(value, JsonAppend):
+                    current = json.loads(text[start:end])
+                    extra = value.value
+                    if type(current) is not type(extra) or (
+                        isinstance(current, dict)
+                        and isinstance(extra, dict)
+                        and current.keys() & extra.keys()
+                    ):
+                        raise ProjectWriteError("Invalid JSON insertion")
+                    encoded = json.dumps(extra, ensure_ascii=True, allow_nan=False)[
+                        1:-1
+                    ]
+                    replacements.append(
+                        (end - 1, end - 1, ("," if current else "") + encoded)
+                    )
+                else:
+                    replacements.append(
+                        (
+                            start,
+                            end,
+                            json.dumps(value, ensure_ascii=True, allow_nan=False),
+                        )
+                    )
         replacements.sort()
         if any(
             a[1] > b[0] for a, b in zip(replacements, replacements[1:], strict=False)
@@ -153,6 +182,116 @@ def write_copy(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def first_source_pair(project: Project) -> tuple[Clip, Clip]:
+    """Select the unique earliest source pair by source and both time ranges."""
+    timeline = project.active_timeline
+    if timeline is None:
+        raise ProjectWriteError("An unambiguous active timeline is required")
+    groups: dict[tuple[Any, ...], list[Clip]] = {}
+    for track in timeline.tracks:
+        for clip in track.clips:
+            if clip.type not in {1, 2} or clip.nested_timeline_id is not None:
+                continue
+            if clip.resource is None or any(
+                v is None for v in (clip.in_point, clip.out_point, clip.begin, clip.end)
+            ):
+                raise ProjectWriteError(
+                    "Source pair has unresolved source or time fields"
+                )
+            key = (clip.source_id, clip.in_point, clip.out_point, clip.begin, clip.end)
+            groups.setdefault(key, []).append(clip)
+    if not groups:
+        raise ProjectWriteError("No active-timeline source pair found")
+    begin = min(key[3] for key in groups)
+    first = [clips for key, clips in groups.items() if key[3] == begin]
+    if len(first) != 1 or len(first[0]) != 2 or {c.type for c in first[0]} != {1, 2}:
+        raise ProjectWriteError(
+            "First source pair selection is ambiguous or incomplete"
+        )
+    return next(c for c in first[0] if c.type == 1), next(
+        c for c in first[0] if c.type == 2
+    )
+
+
+def set_clip_state(
+    source: str | Path,
+    output: str | Path,
+    *,
+    enable: bool | None = None,
+    color_tag: int | None = None,
+) -> dict[str, Any]:
+    if enable is None and color_tag is None:
+        raise ProjectWriteError("Specify enable, disable, or a color tag")
+    if enable is not None and type(enable) is not bool:
+        raise ProjectWriteError("Enable state must be boolean")
+    if color_tag is not None and (
+        type(color_tag) is not int or not 1 <= color_tag <= 13
+    ):
+        raise ProjectWriteError("Color tag must be a stored integer value from 1 to 13")
+    project = parse_project(source)
+    video, audio = first_source_pair(project)
+    assert project.active_timeline is not None
+    name = project.active_timeline.document
+    doc = project.raw_documents[name]
+    edits: list[Edit] = []
+    for clip in (video, audio):
+        path = object_path(doc, clip.raw)
+        additions: Raw = {}
+        if enable is not None:
+            if "enable" in clip.raw:
+                edits.append((name, (*path, "enable"), enable))
+            else:
+                additions["enable"] = enable
+        if clip is video and color_tag is not None:
+            payload = base64.b64encode(
+                color_tag.to_bytes(4, "little", signed=True)
+            ).decode("ascii")
+            fields = {"size": 4, "data": payload}
+            if "userData" not in clip.raw:
+                additions["userData"] = [{"key": 13000, **fields}]
+            else:
+                entries = objects(clip.raw["userData"], "userData")
+                matches = [entry for entry in entries if entry.get("key") == 13000]
+                if len(matches) > 1:
+                    raise ProjectWriteError("Duplicate color tag entries are ambiguous")
+                if matches:
+                    entry = matches[0]
+                    if type(entry["key"]) is not int:
+                        raise ProjectWriteError("Color tag key must be an integer")
+                    entry_path = object_path(doc, entry)
+                    missing = {}
+                    for field, value in fields.items():
+                        if field in entry:
+                            edits.append((name, (*entry_path, field), value))
+                        else:
+                            missing[field] = value
+                    if missing:
+                        edits.append((name, entry_path, JsonAppend(missing)))
+                else:
+                    edits.append(
+                        (
+                            name,
+                            (*path, "userData"),
+                            JsonAppend([{"key": 13000, **fields}]),
+                        )
+                    )
+        if additions:
+            edits.append((name, path, JsonAppend(additions)))
+
+    def validate(updated: Project) -> None:
+        new_video, new_audio = first_source_pair(updated)
+        if (new_video.id, new_audio.id) != (video.id, audio.id):
+            raise ProjectWriteError("Post-write pair validation failed")
+        if enable is not None and any(
+            c.raw.get("enable") is not enable for c in (new_video, new_audio)
+        ):
+            raise ProjectWriteError("Post-write enable state validation failed")
+        if color_tag is not None and new_video.color_tag != color_tag:
+            raise ProjectWriteError("Post-write color tag validation failed")
+
+    return write_copy(Path(source), Path(output), project, edits, validate)
 
 
 def gain_target(clip: Clip) -> tuple[Raw, list[Raw]] | None:

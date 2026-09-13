@@ -9,7 +9,12 @@ from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.project import ProjectParseError, parse_project, project_summary
 from kestrel.project.semantic import semantic_diff_files
-from kestrel.project.writer import ProjectWriteError, set_audio_gain, set_trim
+from kestrel.project.writer import (
+    ProjectWriteError,
+    set_audio_gain,
+    set_clip_state,
+    set_trim,
+)
 
 
 def render(result: dict[str, Any]) -> str:
@@ -72,6 +77,26 @@ def main() -> None:
         required=True,
         help="Amount removed from the current source end",
     )
+    state_parser = commands.add_parser(
+        "project-set-clip-state",
+        help="Write a copy with source pair state and numeric tag changes",
+    )
+    state_parser.add_argument("input")
+    state_parser.add_argument("output")
+    state_group = state_parser.add_mutually_exclusive_group()
+    state_group.add_argument(
+        "--enable", dest="enable", action="store_const", const=True
+    )
+    state_group.add_argument(
+        "--disable", dest="enable", action="store_const", const=False
+    )
+    state_parser.set_defaults(enable=None)
+    state_parser.add_argument(
+        "--color-tag",
+        type=int,
+        choices=range(1, 14),
+        help="Stored numeric tag (1 through 13)",
+    )
     parser.set_defaults(json=False)
     args = parser.parse_args()
     if args.command is None:
@@ -87,6 +112,10 @@ def main() -> None:
         elif args.command == "project-set-trim":
             result = set_trim(
                 args.input, args.output, args.left_seconds, args.right_seconds
+            )
+        elif args.command == "project-set-clip-state":
+            result = set_clip_state(
+                args.input, args.output, enable=args.enable, color_tag=args.color_tag
             )
         else:
             result = (
