@@ -55,6 +55,27 @@ def positive_int(value: Any, label: str) -> int:
     return value
 
 
+def identity_payload(entries: list[Raw], key: int, size: int) -> tuple[Raw, bytes]:
+    candidates = [entry for entry in entries if entry.get("key") == key]
+    if len(candidates) != 1:
+        raise ProjectWriteError(f"Missing or ambiguous identity userData key {key}")
+    entry = candidates[0]
+    if (
+        type(entry["key"]) is not int
+        or type(entry.get("size")) is not int
+        or entry["size"] != size
+        or not isinstance(entry.get("data"), str)
+    ):
+        raise ProjectWriteError(f"Unsupported identity payload for key {key}")
+    try:
+        payload = base64.b64decode(entry["data"], validate=True)
+    except ValueError as error:
+        raise ProjectWriteError(f"Malformed Base64 payload for key {key}") from error
+    if len(payload) != size:
+        raise ProjectWriteError(f"Incorrect identity payload length for key {key}")
+    return entry, payload
+
+
 @dataclass
 class EmptyTemplate:
     project: Project
@@ -67,6 +88,11 @@ class EmptyTemplate:
     project_guid: str
     directory: str
     uuid_entries: list[Raw]
+    bus_uuid: str
+    instance_entry: Raw
+    instance_uuid: str
+    token_entry: Raw
+    token: str
 
 
 def discover_empty_template(project: Project) -> EmptyTemplate:
@@ -189,6 +215,47 @@ def discover_empty_template(project: Project) -> EmptyTemplate:
                 "Timeline UUID payload does not match its catalog identity"
             )
         matched.append(entry)
+    instance_entry, payload = identity_payload(entries, 3, 64)
+    if payload[38:] != bytes(26) or payload[:1] != b"{" or payload[37:38] != b"}":
+        raise ProjectWriteError("Unsupported key 3 UUID padding or format")
+    try:
+        instance_uuid = payload[:38].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ProjectWriteError("Non-ASCII key 3 UUID") from error
+    uuid_value(instance_uuid)
+    token_entry, payload = identity_payload(entries, 140, 32)
+    if not re.fullmatch(rb"[0-9a-f]{32}", payload):
+        raise ProjectWriteError("Unsupported key 140 token format")
+    token = payload.decode("ascii")
+    buses = objects(timeline.raw.get("audioBusInfos"), "audioBusInfos")
+    if not buses:
+        raise ProjectWriteError("Missing main audio bus")
+    bus_ids = [uuid_value(bus.get("busUid")) for bus in buses]
+    if len(set(bus_ids)) != len(bus_ids):
+        raise ProjectWriteError("Ambiguous audio bus identities")
+    bus_uuid = buses[0]["busUid"]
+    for track in timeline.tracks:
+        refs = track.raw.get("busUuids", [])
+        if not isinstance(refs, list) or any(
+            uuid_value(ref) not in bus_ids for ref in refs
+        ):
+            raise ProjectWriteError("Unresolved track bus reference")
+    if (
+        len(
+            {
+                uuid_value(v)
+                for v in (
+                    project_guid,
+                    media_id,
+                    timeline_uuid,
+                    instance_uuid,
+                    bus_uuid,
+                )
+            }
+        )
+        != 5
+    ):
+        raise ProjectWriteError("Instance identities must be distinct")
     return EmptyTemplate(
         project,
         timeline,
@@ -200,6 +267,11 @@ def discover_empty_template(project: Project) -> EmptyTemplate:
         project_guid,
         directory,
         matched,
+        bus_uuid,
+        instance_entry,
+        instance_uuid,
+        token_entry,
+        token,
     )
 
 
@@ -222,7 +294,14 @@ def instantiate_template(
     project = parse_project(template)
     graph = discover_empty_template(project)
     old_ids = {
-        uuid_value(v) for v in (graph.project_guid, graph.media_id, graph.timeline_uuid)
+        uuid_value(v)
+        for v in (
+            graph.project_guid,
+            graph.media_id,
+            graph.timeline_uuid,
+            graph.bus_uuid,
+            graph.instance_uuid,
+        )
     }
     reserved = set(old_ids)
     # Avoid all textual template identities, including stable track and bus UUIDs.
@@ -253,11 +332,14 @@ def instantiate_template(
     project_guid = fresh("project_guid", graph.project_guid)
     media_id = fresh("timeline_mediaId", graph.media_id)
     timeline_uuid = fresh("timeline_uuid", graph.timeline_uuid)
+    bus_uuid = fresh("audioBusInfos[0].busUid", graph.bus_uuid)
+    instance_uuid = fresh("userData[3]", graph.instance_uuid)
     # No derivation is proven: this is an independent instance-specific opaque token.
     project_source = secrets.token_hex(16)
-    if project_source.casefold() == graph.info["project_source"].casefold() or any(
-        project_source.casefold() == value.hex for value in reserved
-    ):
+    if project_source.casefold() in {
+        graph.info["project_source"].casefold(),
+        graph.token,
+    } or any(project_source.casefold() == value.hex for value in reserved):
         raise ProjectWriteError("Opaque project identifier collision")
     generated.append(
         {
@@ -265,6 +347,16 @@ def instantiate_template(
             "original": graph.info["project_source"],
             "generated": project_source,
         }
+    )
+    token = secrets.token_hex(16)
+    if token in {
+        graph.token,
+        project_source,
+        graph.info["project_source"].lower(),
+    } or any(token == value.hex for value in reserved):
+        raise ProjectWriteError("Opaque timeline identifier collision")
+    generated.append(
+        {"field": "userData[140]", "original": graph.token, "generated": token}
     )
     timestamp = int(time.time())
     save_path = str(Path(output).resolve())
@@ -322,6 +414,47 @@ def instantiate_template(
     timeline_path = object_path(
         project.raw_documents[graph.timeline.document], graph.timeline.raw
     )
+    edits.append(
+        (
+            graph.timeline.document,
+            (*timeline_path, "audioBusInfos", 0, "busUid"),
+            bus_uuid,
+        )
+    )
+    expected_tracks = []
+    for track in graph.timeline.tracks:
+        expected = dict(track.raw)
+        if "busUuids" in track.raw:
+            refs = [
+                uuid_style(uuid_value(bus_uuid), ref)
+                if uuid_value(ref) == uuid_value(graph.bus_uuid)
+                else ref
+                for ref in track.raw["busUuids"]
+            ]
+            expected["busUuids"] = refs
+            path = object_path(
+                project.raw_documents[graph.timeline.document], track.raw
+            )
+            for index, (old, new) in enumerate(
+                zip(track.raw["busUuids"], refs, strict=True)
+            ):
+                if old != new:
+                    edits.append(
+                        (graph.timeline.document, (*path, "busUuids", index), new)
+                    )
+        expected_tracks.append(expected)
+    for entry, payload in (
+        (graph.instance_entry, instance_uuid.encode("ascii") + bytes(26)),
+        (graph.token_entry, token.encode("ascii")),
+    ):
+        path = object_path(project.raw_documents[graph.timeline.document], entry)
+        edits.append(
+            (
+                graph.timeline.document,
+                (*path, "data"),
+                base64.b64encode(payload).decode("ascii"),
+            )
+        )
     if width is not None and height is not None:
         resolution = [width, height]
         edits.extend(
@@ -348,11 +481,23 @@ def instantiate_template(
 
     def validate(updated: Project) -> None:
         result = discover_empty_template(updated)
-        actual_ids = (result.project_guid, result.media_id, result.timeline_uuid)
-        if actual_ids != (project_guid, media_id, timeline_uuid) or any(
-            uuid_value(v) in old_ids for v in actual_ids
-        ):
+        actual_ids = (
+            result.project_guid,
+            result.media_id,
+            result.timeline_uuid,
+            result.bus_uuid,
+            result.instance_uuid,
+        )
+        if actual_ids != (
+            project_guid,
+            media_id,
+            timeline_uuid,
+            bus_uuid,
+            instance_uuid,
+        ) or any(uuid_value(v) in old_ids for v in actual_ids):
             raise ProjectWriteError("Post-write identity freshness validation failed")
+        if result.token != token or result.token == graph.token:
+            raise ProjectWriteError("Post-write token freshness validation failed")
         if any(result.info.get(key) != value for key, value in updates.items()):
             raise ProjectWriteError("Post-write metadata validation failed")
         if (
@@ -362,9 +507,7 @@ def instantiate_template(
             raise ProjectWriteError("Post-write settings validation failed")
         if result.item["create_time"] != timestamp:
             raise ProjectWriteError("Post-write creation timestamp validation failed")
-        if [t.raw for t in result.timeline.tracks] != [
-            t.raw for t in graph.timeline.tracks
-        ]:
+        if [t.raw for t in result.timeline.tracks] != expected_tracks:
             raise ProjectWriteError(
                 "Post-write empty track preservation validation failed"
             )

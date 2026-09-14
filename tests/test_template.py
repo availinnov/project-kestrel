@@ -26,6 +26,7 @@ from kestrel.project.writer import ProjectWriteError
 PROJECT_ID = "{11111111-1111-4111-8111-111111111111}"
 MEDIA_ID = "{22222222-2222-4222-8222-222222222222}"
 TIMELINE_ID = "{33333333-3333-4333-8333-333333333333}"
+INSTANCE_ID = "{55555555-5555-4555-8555-555555555555}"
 DIRECTORY = f"ProjectFolder/Medias/{MEDIA_ID}/"
 DOCUMENT = DIRECTORY + "timeline.wesproj"
 
@@ -122,6 +123,19 @@ def template_documents() -> dict[str, Any]:
                             "key": 999,
                             "size": 38,
                             "data": base64.b64encode(TIMELINE_ID.encode()).decode(),
+                        },
+                        {
+                            "key": 3,
+                            "size": 64,
+                            "data": base64.b64encode(
+                                INSTANCE_ID.encode() + bytes(26)
+                            ).decode(),
+                            "unknown": "preserve",
+                        },
+                        {
+                            "key": 140,
+                            "size": 32,
+                            "data": base64.b64encode(b"b" * 32).decode(),
                         },
                     ],
                     "unknown_setting": {"retain": True},
@@ -248,7 +262,9 @@ def test_instantiate_and_preserve(
         assert entry["size"] == size
     assert new.timeline.raw["userData"][0] == old.timeline.raw["userData"][0]
     assert new.timeline.raw["userData"][3] == old.timeline.raw["userData"][3]
-    assert [t.raw for t in new.timeline.tracks] == [t.raw for t in old.timeline.tracks]
+    expected_tracks = copy.deepcopy([t.raw for t in old.timeline.tracks])
+    expected_tracks[0]["busUuids"] = [new.bus_uuid]
+    assert [t.raw for t in new.timeline.tracks] == expected_tracks
     assert after.resources == [] and after.duration == 0
     assert new.item == {
         **old.item,
@@ -257,7 +273,25 @@ def test_instantiate_and_preserve(
         "create_time": new.item["create_time"],
     }
     assert new.info["project_timeline_ratio"] == old.info["project_timeline_ratio"]
-    assert new.timeline.raw["audioBusInfos"] == old.timeline.raw["audioBusInfos"]
+    assert new.timeline.raw["audioBusInfos"] == [{"busUid": new.bus_uuid}]
+    assert new.bus_uuid != old.bus_uuid
+    assert UUID(new.bus_uuid).version == 4
+    assert new.instance_uuid != old.instance_uuid
+    assert base64.b64decode(
+        new.instance_entry["data"], validate=True
+    ) == new.instance_uuid.encode() + bytes(26)
+    assert new.instance_entry == {
+        **old.instance_entry,
+        "data": new.instance_entry["data"],
+    }
+    assert new.token != old.token
+    assert (
+        base64.b64decode(new.token_entry["data"], validate=True) == new.token.encode()
+    )
+    assert len(new.token) == 32
+    int(new.token, 16)
+    assert after.raw_documents[new.timeline.document]["serialNumber"] == 8
+    assert new.timeline.raw["timelineId"] == 7
     renamed = {
         entry["original"]: entry["generated"] for entry in report["renamed_entries"]
     }
@@ -457,3 +491,87 @@ def test_repeated_instantiation_generates_independent_graphs(tmp_path: Path) -> 
     )
     assert first.info["project_source"] != second.info["project_source"]
     assert first.project_guid not in second.info["proj_cover_proj_path"]
+    assert first.bus_uuid != second.bus_uuid
+    assert first.instance_uuid != second.instance_uuid
+    assert first.token != second.token
+
+
+def test_bus_links_and_unrelated_identities_preserved(tmp_path: Path) -> None:
+    docs = template_documents()
+    timeline = docs[DOCUMENT]["timelineInfos"][0]
+    other_bus = "66666666-6666-4666-8666-666666666666"
+    timeline["audioBusInfos"].append({"busUid": other_bus, "unknown": 123})
+    timeline["trackInfos"][0]["busUuids"].append(other_bus)
+    timeline["trackInfos"].append(
+        {
+            "uuid": "track-b",
+            "trackType": 2,
+            "clipList": [],
+            "busUuids": [timeline["audioBusInfos"][0]["busUid"]],
+        }
+    )
+    source = write_template(tmp_path, docs)
+    output = tmp_path / "generated.zip"
+    instantiate_template(source, output, name="new")
+    result = discover_empty_template(parse_project(output))
+    assert result.timeline.tracks[0].raw["busUuids"] == [result.bus_uuid, other_bus]
+    assert result.timeline.tracks[2].raw["busUuids"] == [result.bus_uuid]
+    assert result.timeline.raw["audioBusInfos"][1] == timeline["audioBusInfos"][1]
+    assert result.timeline.raw["userData"][:1] == timeline["userData"][:1]
+    assert result.timeline.raw["userData"][3] == timeline["userData"][3]
+
+
+@pytest.mark.parametrize("key", [3, 140])
+@pytest.mark.parametrize(
+    "variant",
+    ["missing", "duplicate", "size", "base64", "length", "content", "padding"],
+)
+def test_malformed_instance_payload_rejected(
+    tmp_path: Path, key: int, variant: str
+) -> None:
+    docs = template_documents()
+    entries = docs[DOCUMENT]["timelineInfos"][0]["userData"]
+    entry = next(item for item in entries if item["key"] == key)
+    if variant == "missing":
+        entries.remove(entry)
+    elif variant == "duplicate":
+        entries.append(copy.deepcopy(entry))
+    elif variant == "size":
+        entry["size"] -= 1
+    elif variant == "base64":
+        entry["data"] = "!invalid!"
+    else:
+        payload = base64.b64decode(entry["data"])
+        if variant == "length":
+            payload = payload[:-1]
+        elif variant == "content":
+            payload = b"z" + payload[1:]
+        else:
+            payload = payload[:-1] + b"\x00" if key == 140 else payload[:-1] + b"x"
+        entry["data"] = base64.b64encode(payload).decode()
+    source = write_template(tmp_path, docs)
+    output = tmp_path / "rejected.zip"
+    with pytest.raises(ProjectWriteError):
+        instantiate_template(source, output, name="new")
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "variant", ["missing", "duplicate", "unknown_reference", "malformed_reference"]
+)
+def test_invalid_bus_graph_rejected(tmp_path: Path, variant: str) -> None:
+    docs = template_documents()
+    timeline = docs[DOCUMENT]["timelineInfos"][0]
+    if variant == "missing":
+        timeline["audioBusInfos"] = []
+    elif variant == "duplicate":
+        timeline["audioBusInfos"] *= 2
+    else:
+        timeline["trackInfos"][0]["busUuids"] = [
+            INSTANCE_ID if variant == "unknown_reference" else "invalid"
+        ]
+    source = write_template(tmp_path, docs)
+    output = tmp_path / "rejected.zip"
+    with pytest.raises(ProjectWriteError):
+        instantiate_template(source, output, name="new")
+    assert not output.exists()
