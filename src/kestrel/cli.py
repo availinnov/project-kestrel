@@ -9,7 +9,7 @@ from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.project import ProjectParseError, parse_project, project_summary
 from kestrel.project.semantic import semantic_diff_files
-from kestrel.project.sequence import build_sequence
+from kestrel.project.sequence import apply_plan, build_sequence
 from kestrel.project.template import instantiate_template
 from kestrel.project.writer import (
     ProjectWriteError,
@@ -106,6 +106,12 @@ def main() -> None:
     )
     clone_parser.add_argument("input")
     clone_parser.add_argument("output")
+    plan_parser = commands.add_parser(
+        "project-apply-plan", help="Apply source keep/drop and trim decisions"
+    )
+    plan_parser.add_argument("input")
+    plan_parser.add_argument("plan")
+    plan_parser.add_argument("output")
     sequence_parser = commands.add_parser(
         "project-build-sequence",
         help="Build an experimental sequence from existing sources",
@@ -145,6 +151,8 @@ def main() -> None:
             )
         elif args.command == "project-clone-video-track":
             result = clone_video_track(args.input, args.output)
+        elif args.command == "project-apply-plan":
+            result = apply_plan(args.input, args.plan, args.output)
         elif args.command == "project-build-sequence":
             result = build_sequence(args.input, args.output, args.count)
         elif args.command == "project-instantiate-template":

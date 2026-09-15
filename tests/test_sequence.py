@@ -18,6 +18,7 @@ from kestrel.project.sequence import (
     build_constant_speed_param,
     build_sequence,
     initial_source_range,
+    resource_from_media,
 )
 from kestrel.project.writer import ProjectWriteError
 
@@ -66,7 +67,9 @@ def fixture(tmp_path: Path, overlap: bool = False) -> Path:
             filename=f"file:/synthetic/{i}.mp4",
             mediaLength=(i + 1) * 10_000_000,
             streamType=2,
-            vidStreamInfo=[{"vidStreamId": 0}],
+            vidStreamInfo=[
+                {"vidStreamId": 0, "fourCC": 123, "bitsDepth": 24, "ViewsCount": 0}
+            ],
             audStreamInfo=[{"audStreamId": 1}],
         )
         for i in range(3)
@@ -406,3 +409,74 @@ def test_unrelated_populated_track(tmp_path: Path) -> None:
     after = parse_project(output)
     assert before.active_timeline and after.active_timeline
     assert before.active_timeline.tracks[1].raw == after.active_timeline.tracks[1].raw
+
+
+@pytest.mark.parametrize("depth", [24, 32])
+@pytest.mark.parametrize("metadata_usage", [None, 7])
+def test_materialized_video_state(depth: int, metadata_usage: int | None) -> None:
+    template, metadata, media = resource_mapping_fixture()
+    template.raw["vidStreamInfo"][0]["bitsDepth"] = depth
+    if metadata_usage is not None:
+        metadata["sourceInfo"]["vidStreamInfos"][0]["ViewsCount"] = metadata_usage
+    original = copy.deepcopy(template.raw)
+    result = resource_from_media(template, metadata, media, "new")
+    assert result.raw["vidStreamInfo"][0]["ViewsCount"] == 0
+    assert result.raw["vidStreamInfo"][0]["bitsDepth"] == depth
+    assert template.raw == original
+
+
+def resource_mapping_fixture() -> tuple[Resource, Any, Any]:
+    template = Resource(
+        "old",
+        "timeline",
+        "old.mp4",
+        10,
+        {
+            "mediaLength": 10,
+            "vidStreamInfo": [{"fourCC": 123, "bitsDepth": 24, "ViewsCount": 1}],
+            "audStreamInfo": [{}],
+        },
+    )
+    metadata = {
+        "file_name": "new.mp4",
+        "sourceInfo": {
+            "basicInfo": {"mediaLength": 20},
+            "vidStreamInfos": [{"fourCC": 123}],
+            "audStreamInfos": [{}],
+        },
+    }
+    return template, metadata, {"download_url": "new.mp4", "media_length": 20}
+
+
+@pytest.mark.parametrize("depth", [None, 0, -1, True, 24.0, "24"])
+def test_missing_video_depth_rejects_invalid_template(depth: Any) -> None:
+    template, metadata, media = resource_mapping_fixture()
+    if depth is None:
+        del template.raw["vidStreamInfo"][0]["bitsDepth"]
+    else:
+        template.raw["vidStreamInfo"][0]["bitsDepth"] = depth
+    with pytest.raises(ProjectWriteError, match="bitsDepth"):
+        resource_from_media(template, metadata, media, "new")
+
+
+def test_missing_video_depth_rejects_different_codec() -> None:
+    template, metadata, media = resource_mapping_fixture()
+    metadata["sourceInfo"]["vidStreamInfos"][0]["fourCC"] = 456
+    with pytest.raises(ProjectWriteError, match="matching fourCC"):
+        resource_from_media(template, metadata, media, "new")
+
+
+def test_explicit_video_depth_uses_metadata() -> None:
+    template, metadata, media = resource_mapping_fixture()
+    metadata["sourceInfo"]["vidStreamInfos"][0].update(fourCC=456, bitsDepth=30)
+    result = resource_from_media(template, metadata, media, "new")
+    assert result.raw["vidStreamInfo"][0]["bitsDepth"] == 30
+
+
+def test_unresolved_video_field_still_rejected() -> None:
+    template, metadata, media = resource_mapping_fixture()
+    template.raw["vidStreamInfo"][0]["unknown"] = 42
+    with pytest.raises(
+        ProjectWriteError, match="Unresolved source stream field: unknown"
+    ):
+        resource_from_media(template, metadata, media, "new")

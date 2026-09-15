@@ -8,6 +8,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from kestrel.editplan import EditPlan, parse_plan_json, trimmed_range
 from kestrel.project.models import Clip, Raw, Resource
 from kestrel.project.parser import objects, parse_project
 from kestrel.project.writer import (
@@ -100,7 +101,27 @@ def resource_from_media(
         if len(source_streams) != 1 or len(raw[target]) != 1:
             raise ProjectWriteError("Only one video and one audio stream are supported")
         stream = raw[target][0]
+        if target == "vidStreamInfo":
+            # Usage belongs to the newly materialized timeline resource.
+            stream["ViewsCount"] = 0
+            if "bitsDepth" not in source_streams[0]:
+                depth = stream.get("bitsDepth")
+                codec = stream.get("fourCC")
+                if (
+                    type(depth) is not int
+                    or depth <= 0
+                    or codec is None
+                    or source_streams[0].get("fourCC") != codec
+                ):
+                    raise ProjectWriteError(
+                        "Missing video bitsDepth requires a positive template depth "
+                        "and matching fourCC"
+                    )
+            else:
+                stream["bitsDepth"] = copy.deepcopy(source_streams[0]["bitsDepth"])
         for key in stream:
+            if target == "vidStreamInfo" and key in ("ViewsCount", "bitsDepth"):
+                continue
             if key in source_streams[0]:
                 stream[key] = copy.deepcopy(source_streams[0][key])
             elif stream[key] not in (0, 0.0, "", None, False):
@@ -209,7 +230,7 @@ def source_order_key(
 
 
 def _build_sequence(
-    source: str | Path, output: str | Path, count: int
+    source: str | Path, output: str | Path, count: int, plan: EditPlan | None = None
 ) -> dict[str, Any]:
     if type(count) is not int or count < 1:
         raise ProjectWriteError("Count must be a positive integer")
@@ -218,6 +239,8 @@ def _build_sequence(
     if timeline is None:
         raise ProjectWriteError("An unambiguous active timeline is required")
     fps = timeline.raw.get("frameRate")
+    if not isinstance(fps, dict):
+        raise ProjectWriteError("Timeline FPS is missing")
     catalog_docs = [
         (n, d)
         for n, d in project.raw_documents.items()
@@ -272,6 +295,7 @@ def _build_sequence(
         if template_linkage is not None and template_linkage != identifier:
             raise ProjectWriteError("Template AV linkage mismatch")
         template_linkage = identifier
+    decisions = {c.catalog_id: c for c in plan.clips} if plan else {}
     fresh, identities = identity_allocator(project)
     eligible: list[Resource] = []
     new_resources: list[Raw] = []
@@ -309,7 +333,7 @@ def _build_sequence(
                 continue
             try:
                 resource = resource_from_media(
-                    video_template.resource, metadata, media, "pending"
+                    video_template.resource, metadata, media, "pending:" + catalog_id
                 )
             except (KeyError, TypeError, ProjectWriteError) as error:
                 rejected_sources.append(f"{catalog_id}: {error}")
@@ -330,21 +354,69 @@ def _build_sequence(
             initial_source_range(resource, fps)
         except ProjectWriteError:
             continue
-        if not matches:
+        if not matches and (
+            plan is None or (catalog_id in decisions and decisions[catalog_id].keep)
+        ):
             resource.id = fresh(None, "resource.sourceUuid")
             resource.raw["sourceUuid"] = resource.id
             new_resources.append(resource.raw)
         eligible.append(resource)
         items[resource.id] = (catalog_id, media)
         seen_paths.add(source_path)
-        if len(eligible) == count:
+        if plan is None and len(eligible) == count:
             break
-    if len(eligible) < count:
-        raise ProjectWriteError(
-            f"Requested {count} sources; only {len(eligible)} are eligible"
-            + ("; " + "; ".join(rejected_sources) if rejected_sources else "")
-        )
-    layout = sequence_layout(eligible[:count], fps)
+    dropped = []
+    adjustments = []
+    if plan is not None:
+        resolved = {items[r.id][0] for r in eligible}
+        missing = set(decisions) - set(catalog["media_items"])
+        ineligible = set(decisions) - resolved - missing
+        omitted = resolved - set(decisions)
+        if missing or ineligible or omitted:
+            raise ProjectWriteError(
+                f"Plan source mismatch: unknown={sorted(missing)}, "
+                f"ineligible={sorted(ineligible)}, omitted={sorted(omitted)}"
+            )
+        layout = []
+        begin = 0
+        for resource in eligible:
+            catalog_id = items[resource.id][0]
+            edit = decisions[catalog_id]
+            if not edit.keep:
+                dropped.append(
+                    dict(
+                        catalog_id=catalog_id,
+                        filename=resource.filename,
+                        capture_time=capture_time(project.raw_documents, catalog_id),
+                    )
+                )
+                continue
+            full_out = initial_source_range(resource, fps)[1]
+            start, end = trimmed_range(full_out, edit, Fraction(fps["num"], fps["den"]))
+            if (start, end) != (edit.trim_start_ticks, full_out - edit.trim_end_ticks):
+                adjustments.append(
+                    dict(
+                        catalog_id=catalog_id,
+                        requested_in=edit.trim_start_ticks,
+                        requested_out=full_out - edit.trim_end_ticks,
+                        actual_in=start,
+                        actual_out=end,
+                    )
+                )
+            layout.append(
+                SequenceItem(resource, start, end, begin, begin + end - start)
+            )
+            begin += end - start
+        count = len(layout)
+        if not count:
+            raise ProjectWriteError("Plan must keep at least one source")
+    else:
+        if len(eligible) < count:
+            raise ProjectWriteError(
+                f"Requested {count} sources; only {len(eligible)} are eligible"
+                + ("; " + "; ".join(rejected_sources) if rejected_sources else "")
+            )
+        layout = sequence_layout(eligible[:count], fps)
     duration = layout[-1].timeline_end
     for track in timeline.tracks:
         if any(track is destination for destination in destinations):
@@ -374,7 +446,7 @@ def _build_sequence(
                 enable=True,
                 sourceUuid=item.resource.id,
                 filename=item.resource.filename,
-                inPoint=0,
+                inPoint=item.source_in,
                 outPoint=item.source_out,
                 tlBegin=item.timeline_begin,
                 tlEnd=item.timeline_end,
@@ -384,9 +456,15 @@ def _build_sequence(
             )
             clip["speed"]["speedParam"] = build_constant_speed_param(item.source_out)
             clip["speed"].update(
-                offset=0.0, offsetEnd=item.source_out / TICKS_PER_SECOND, reverse=False
+                offset=item.source_in / TICKS_PER_SECOND,
+                offsetEnd=item.source_out / TICKS_PER_SECOND,
+                reverse=False,
             )
-            if index == 0:
+            if (
+                index == 0
+                and item.source_in == 0
+                and item.source_out == initial_source_range(item.resource, fps)[1]
+            ):
                 # Prefer the selected source's established full-range representation.
                 examples = [
                     c
@@ -523,6 +601,16 @@ def _build_sequence(
                 capture_time_available=capture_time(project.raw_documents, catalog_id)
                 is not None,
                 frame_aligned_out_point=item.source_out,
+                keep=True,
+                full_out_point=initial_source_range(item.resource, fps)[1],
+                trim_start_ticks_requested=decisions[catalog_id].trim_start_ticks
+                if plan
+                else 0,
+                trim_end_ticks_requested=decisions[catalog_id].trim_end_ticks
+                if plan
+                else 0,
+                in_point=item.source_in,
+                out_point=item.source_out,
                 tl_begin=item.timeline_begin,
                 tl_end=item.timeline_end,
                 video_clip_id=generated[0][-1]["thisUId"],
@@ -636,13 +724,23 @@ def _build_sequence(
                 found_pair.append(matches[0])
             for c in found_pair:
                 if (c.in_point, c.out_point, c.begin, c.end) != (
-                    0,
+                    pair["in_point"],
                     pair["frame_aligned_out_point"],
                     pair["tl_begin"],
                     pair["tl_end"],
                 ):
                     raise ProjectWriteError("Post-write sequence geometry mismatch")
-                if initial_source_range(c.resource, fps)[1] != c.out_point:
+                full_out = initial_source_range(c.resource, fps)[1]
+                expected_range = (
+                    trimmed_range(
+                        full_out,
+                        decisions[pair["catalog_id"]],
+                        Fraction(fps["num"], fps["den"]),
+                    )
+                    if plan
+                    else (0, full_out)
+                )
+                if (c.in_point, c.out_point) != expected_range:
                     raise ProjectWriteError("Post-write endpoint mismatch")
                 if c.raw["speed"]["speedParam"] != build_constant_speed_param(
                     c.out_point
@@ -677,7 +775,29 @@ def _build_sequence(
         ],
         generated_identity_fields=identities,
     )
+    if plan is not None:
+        report.update(
+            total_plan_sources=len(plan.clips),
+            kept_source_count=count,
+            dropped_source_count=len(dropped),
+            dropped_sources=dropped,
+            trim_adjustments=adjustments,
+        )
     return report
+
+
+def apply_plan(
+    source: str | Path, plan_path: str | Path, output: str | Path
+) -> dict[str, Any]:
+    try:
+        plan = parse_plan_json(Path(plan_path).read_text(encoding="utf-8-sig"))
+        return _build_sequence(source, output, 1, plan)
+    except ProjectWriteError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ProjectWriteError(
+            f"Invalid plan or unsupported source structure: {error}"
+        ) from error
 
 
 def build_sequence(
