@@ -2,11 +2,16 @@
 
 `kestrel project-build-sequence INPUT OUTPUT --count N` places the first N
 eligible, distinct catalog sources consecutively from timeline zero. It requires
-ordinary video with audio, a supported existing AV template, and compatible
-destination tracks with no overlapping clips. Existing content is preserved;
-content extending beyond the generated sequence causes a conservative failure.
+ordinary video with audio and a supported existing AV template pair. Each template
+track must contain exactly its template clip. The generated sequence replaces that
+pair on the same tracks. All other tracks stay unchanged; unrelated content
+extending beyond the generated sequence causes a conservative failure.
 
-Catalog order determines selection. Existing timeline resources are reused.
+Sources are sorted by the positive integer `sourceInfo.basicInfo.createDate` in
+imported `media.json`, then display name (case-folded, then original), then catalog
+ID. Missing or invalid capture times sort last using the same name/ID fallback
+and are reported. The template source participates normally. Existing timeline
+resources are reused.
 Catalog-only sources require complete imported metadata and a supported Resource
 template; unresolved source fields are reported instead of fabricated. No source
 files are accessed. No catalog entries or media assets are created.

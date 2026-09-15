@@ -1,6 +1,7 @@
 """Synthetic range rounding and sequence preservation controls."""
 
 import base64
+import copy
 import json
 import subprocess
 import zipfile
@@ -175,6 +176,18 @@ def test_sequence(tmp_path: Path, count: int) -> None:
         f"s{i}" for i in range(count)
     ]
     assert before.active_timeline and after.active_timeline
+    assert report["video_track_id"] == "t1"
+    assert report["audio_track_id"] == "t2"
+    for original, actual in zip(
+        before.active_timeline.tracks, after.active_timeline.tracks, strict=True
+    ):
+        if original.id in ("t1", "t2"):
+            assert len(actual.clips) == count
+        else:
+            assert actual.raw == original.raw
+    assert not any(
+        c.id in ("c1", "c2") for t in after.active_timeline.tracks for c in t.clips
+    )
     new_ids = [x["generated"] for x in report["generated_identity_fields"]]
     assert len(new_ids) == len(set(new_ids)) == count * 5
     previous = 0
@@ -211,9 +224,22 @@ def test_invalid_count(tmp_path: Path, count: int) -> None:
     assert not (tmp_path / "out.zip").exists()
 
 
-def test_overlap(tmp_path: Path) -> None:
-    with pytest.raises(ProjectWriteError, match="overlap"):
-        build_sequence(fixture(tmp_path, True), tmp_path / "out.zip", 1)
+@pytest.mark.parametrize("track_index", [0, 2])
+def test_extra_destination_content(tmp_path: Path, track_index: int) -> None:
+    source = fixture(tmp_path)
+
+    def change(docs: Any) -> None:
+        clips = docs["main/timeline.wesproj"]["timelineInfos"][0]["trackInfos"][
+            track_index
+        ]["clipList"]
+        extra = copy.deepcopy(clips[0])
+        extra["thisUId"] = "extra"
+        clips.append(extra)
+
+    rewrite_fixture(source, change)
+    with pytest.raises(ProjectWriteError, match="only its template"):
+        build_sequence(source, tmp_path / "out.zip", 1)
+    assert not (tmp_path / "out.zip").exists()
 
 
 def test_cli(tmp_path: Path) -> None:
@@ -324,3 +350,59 @@ def test_reject_unsupported(tmp_path: Path, variant: str) -> None:
     with pytest.raises(ProjectWriteError):
         build_sequence(source, tmp_path / "rejected.zip", 1)
     assert not (tmp_path / "rejected.zip").exists()
+
+
+@pytest.mark.parametrize(
+    ("dates", "names", "expected"),
+    [
+        ([30, 20, 10], ["a", "b", "c"], [2, 1, 0]),
+        ([10, 10, 10], ["c", "b", "a"], [2, 1, 0]),
+        ([10, 10, 10], ["same", "same", "same"], [0, 1, 2]),
+        ([None, 10, None], ["c", "z", "a"], [1, 2, 0]),
+        ([0, -1, True], ["c", "b", "a"], [2, 1, 0]),
+        (["10", 1.5, None], ["c", "b", "a"], [2, 1, 0]),
+    ],
+)
+def test_capture_order(
+    tmp_path: Path, dates: list[Any], names: list[str], expected: list[int]
+) -> None:
+    source = fixture(tmp_path)
+
+    def change(docs: Any) -> None:
+        items = docs["catalog.json"]["media_items"]
+        for i in range(3):
+            items[f"m{i}"]["name"] = names[i]
+            docs[f"ProjectFolder/Medias/m{i}/media.json"] = {
+                "sourceInfo": {"basicInfo": {"createDate": dates[i]}}
+            }
+        docs["catalog.json"]["media_items"] = dict(reversed(list(items.items())))
+
+    rewrite_fixture(source, change)
+    report = build_sequence(source, tmp_path / "out.zip", 3)
+    selected = report["selected_sources"]
+    assert [s["catalog_id"] for s in selected] == [f"m{i}" for i in expected]
+    assert len({s["source_uuid"] for s in selected}) == 3
+    assert report["ordering_policy"] == "filmora_createDate_then_filename"
+    for item, index in zip(selected, expected, strict=True):
+        valid = type(dates[index]) is int and dates[index] > 0
+        assert item["capture_time_available"] is valid
+        assert item["capture_time"] == (dates[index] if valid else None)
+
+
+def test_unrelated_populated_track(tmp_path: Path) -> None:
+    source = fixture(tmp_path)
+
+    def change(docs: Any) -> None:
+        tracks = docs["main/timeline.wesproj"]["timelineInfos"][0]["trackInfos"]
+        tracks[1]["clipList"] = [
+            {"thisUId": "unrelated", "type": 99, "tlBegin": 0, "tlEnd": 10}
+        ]
+        tracks[1]["opaque"] = {"preserve": True}
+
+    rewrite_fixture(source, change)
+    before = parse_project(source)
+    output = tmp_path / "out.zip"
+    build_sequence(source, output, 3)
+    after = parse_project(output)
+    assert before.active_timeline and after.active_timeline
+    assert before.active_timeline.tracks[1].raw == after.active_timeline.tracks[1].raw

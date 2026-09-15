@@ -191,6 +191,23 @@ def supported_template(clip: Clip) -> bool:
     return True
 
 
+def capture_time(documents: dict[str, Any], catalog_id: str) -> int | None:
+    value: Any = documents.get(f"ProjectFolder/Medias/{catalog_id}/media.json")
+    for key in ("sourceInfo", "basicInfo", "createDate"):
+        value = value.get(key) if isinstance(value, dict) else None
+    return value if type(value) is int and value > 0 else None
+
+
+def source_order_key(
+    documents: dict[str, Any], catalog_id: str, media: Raw
+) -> tuple[bool, int, str, str, str]:
+    timestamp = capture_time(documents, catalog_id)
+    name = media.get("name")
+    if not isinstance(name, str) or not name:
+        name = str(media.get("download_url", "")).replace("\\", "/").rsplit("/", 1)[-1]
+    return timestamp is None, timestamp or 0, name.casefold(), name, catalog_id
+
+
 def _build_sequence(
     source: str | Path, output: str | Path, count: int
 ) -> dict[str, Any]:
@@ -222,6 +239,16 @@ def _build_sequence(
     if not pairs:
         raise ProjectWriteError("No supported ordinary AV template pair exists")
     video_template, audio_template = pairs[0]
+    destinations = []
+    for template in (video_template, audio_template):
+        owners = [t for t in timeline.tracks if any(c is template for c in t.clips)]
+        if len(owners) != 1 or owners[0].type != template.type:
+            raise ProjectWriteError("Template destination track is ambiguous")
+        if len(owners[0].clips) != 1:
+            raise ProjectWriteError(
+                "Destination track must contain only its template clip"
+            )
+        destinations.append(owners[0])
     template_linkage = None
     for template in (video_template, audio_template):
         assert template.resource is not None and template.resource.filename is not None
@@ -252,7 +279,10 @@ def _build_sequence(
     rejected_sources = []
     seen_paths: set[str] = set()
     assert video_template.resource is not None
-    for catalog_id, media in catalog["media_items"].items():
+    for catalog_id, media in sorted(
+        catalog["media_items"].items(),
+        key=lambda item: source_order_key(project.raw_documents, *item),
+    ):
         if media.get("media_type") != 8 or media.get("id") != catalog_id:
             continue
         source_path = media.get("download_url")
@@ -316,30 +346,13 @@ def _build_sequence(
         )
     layout = sequence_layout(eligible[:count], fps)
     duration = layout[-1].timeline_end
-    destinations = []
-    for kind in (1, 2):
-        compatible = []
-        for track in timeline.tracks:
-            if track.type != kind:
-                continue
-            if all(
-                type(c.begin) is int
-                and type(c.end) is int
-                and c.begin >= 0
-                and c.end > c.begin
-                and not (c.begin < duration and c.end > 0)
-                for c in track.clips
-            ):
-                compatible.append(track)
-        if not compatible:
+    for track in timeline.tracks:
+        if any(track is destination for destination in destinations):
+            continue
+        if any(type(c.end) is not int or c.end > duration for c in track.clips):
             raise ProjectWriteError(
-                "Existing timeline content overlaps sequence placement"
+                "Preserved timeline content extends beyond the sequence end"
             )
-        destinations.append(compatible[0])
-    if timeline.duration is None or timeline.duration > duration:
-        raise ProjectWriteError(
-            "Preserved timeline content extends beyond the sequence end"
-        )
     extra_name = timeline.document.replace("timeline.wesproj", "extra.json")
     extra = project.raw_documents.get(extra_name)
     edits: list[Edit] = []
@@ -506,6 +519,9 @@ def _build_sequence(
                 key3=linkage,
                 source_uuid=item.resource.id,
                 resource_duration=item.resource.duration,
+                capture_time=capture_time(project.raw_documents, catalog_id),
+                capture_time_available=capture_time(project.raw_documents, catalog_id)
+                is not None,
                 frame_aligned_out_point=item.source_out,
                 tl_begin=item.timeline_begin,
                 tl_end=item.timeline_end,
@@ -515,7 +531,7 @@ def _build_sequence(
         )
     for track, clips in zip(destinations, generated, strict=True):
         path = object_path(project.raw_documents[timeline.document], track.raw)
-        edits.append((timeline.document, (*path, "clipList"), JsonAppend(clips)))
+        edits.append((timeline.document, (*path, "clipList"), clips))
     # Merge insertions at the same object boundary into one patch.
     merged: dict[tuple[str, tuple[str | int, ...]], dict[str, Any]] = {}
     other = []
@@ -571,6 +587,37 @@ def _build_sequence(
             r.raw for r in project.resources
         ] + new_resources:
             raise ProjectWriteError("Resources changed")
+        updated_tracks = updated.active_timeline.tracks
+        if len(updated_tracks) != len(timeline.tracks):
+            raise ProjectWriteError("Track count changed")
+        for original, actual in zip(timeline.tracks, updated_tracks, strict=True):
+            destination_index = next(
+                (i for i, t in enumerate(destinations) if t is original), None
+            )
+            if destination_index is None:
+                if actual.raw != original.raw:
+                    raise ProjectWriteError("Unrelated track changed")
+            elif (
+                actual.id != original.id
+                or [c.raw for c in actual.clips] != generated[destination_index]
+            ):
+                raise ProjectWriteError("Destination sequence mismatch")
+        if any(
+            c.id in (video_template.id, audio_template.id)
+            for t in updated_tracks
+            for c in t.clips
+        ):
+            raise ProjectWriteError("Original template clip remains")
+        order = [
+            source_order_key(
+                project.raw_documents,
+                s["catalog_id"],
+                catalog["media_items"][s["catalog_id"]],
+            )
+            for s in selected
+        ]
+        if order != sorted(order) or len({s["source_uuid"] for s in selected}) != count:
+            raise ProjectWriteError("Source ordering or uniqueness mismatch")
         for pair in selected:
             found_pair = []
             for field in ("video_clip_id", "audio_clip_id"):
@@ -624,6 +671,10 @@ def _build_sequence(
         video_track_id=destinations[0].id,
         audio_track_id=destinations[1].id,
         selected_sources=selected,
+        ordering_policy="filmora_createDate_then_filename",
+        sources_without_capture_time=[
+            s["catalog_id"] for s in selected if not s["capture_time_available"]
+        ],
         generated_identity_fields=identities,
     )
     return report
