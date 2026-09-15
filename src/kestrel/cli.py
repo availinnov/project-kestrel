@@ -9,6 +9,7 @@ from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.project import ProjectParseError, parse_project, project_summary
 from kestrel.project.semantic import semantic_diff_files
+from kestrel.project.sequence import build_sequence
 from kestrel.project.template import instantiate_template
 from kestrel.project.writer import (
     ProjectWriteError,
@@ -105,6 +106,13 @@ def main() -> None:
     )
     clone_parser.add_argument("input")
     clone_parser.add_argument("output")
+    sequence_parser = commands.add_parser(
+        "project-build-sequence",
+        help="Build an experimental sequence from existing sources",
+    )
+    sequence_parser.add_argument("input")
+    sequence_parser.add_argument("output")
+    sequence_parser.add_argument("--count", type=int, required=True)
     template_parser = commands.add_parser(
         "project-instantiate-template",
         help="Create a fresh empty project from a template",
@@ -137,6 +145,8 @@ def main() -> None:
             )
         elif args.command == "project-clone-video-track":
             result = clone_video_track(args.input, args.output)
+        elif args.command == "project-build-sequence":
+            result = build_sequence(args.input, args.output, args.count)
         elif args.command == "project-instantiate-template":
             result = instantiate_template(
                 args.template,

@@ -387,6 +387,42 @@ def compatible_clone_track(track: Track, clip: Clip) -> bool:
     return True
 
 
+def identity_allocator(
+    project: Project,
+) -> tuple[Callable[[Any, str], str], list[dict[str, Any]]]:
+    # Reserve all existing string values, including IDs in inactive documents.
+    reserved: set[str] = set()
+    pending: list[Any] = list(project.raw_documents.values())
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.values())
+            pending.extend(value.keys())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            reserved.add(value.strip("{}").casefold())
+            try:
+                decoded = (
+                    base64.b64decode(value, validate=True).decode("ascii").rstrip("\0")
+                )
+                reserved.add(decoded.strip("{}").casefold())
+            except (ValueError, UnicodeError):
+                pass
+    identities: list[dict[str, Any]] = []
+
+    def fresh_id(old: Any, field: str) -> str:
+        for _ in range(10):
+            new = str(uuid4())
+            if new.casefold() not in reserved:
+                reserved.add(new.casefold())
+                identities.append({"field": field, "original": old, "generated": new})
+                return new
+        raise ProjectWriteError("Could not allocate a unique object identity")
+
+    return fresh_id, identities
+
+
 def clone_video_track(source: str | Path, output: str | Path) -> dict[str, Any]:
     """Place a disabled video clone on the first compatible track, or a new track."""
     project = parse_project(source)
@@ -410,27 +446,7 @@ def clone_video_track(source: str | Path, output: str | Path) -> dict[str, Any]:
         None,
     )
     reused = destination is not None
-    # Reserve all existing string values, including IDs in inactive documents.
-    reserved: set[str] = set()
-    pending: list[Any] = list(project.raw_documents.values())
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-        elif isinstance(value, str):
-            reserved.add(value.strip("{}").casefold())
-    identities: list[dict[str, Any]] = []
-
-    def fresh_id(old: Any, field: str) -> str:
-        for _ in range(10):
-            new = str(uuid4())
-            if new.casefold() not in reserved:
-                reserved.add(new.casefold())
-                identities.append({"field": field, "original": old, "generated": new})
-                return new
-        raise ProjectWriteError("Could not allocate a unique object identity")
+    fresh_id, identities = identity_allocator(project)
 
     new_clip = copy.deepcopy(video.raw)
     new_clip["thisUId"] = fresh_id(video.id, "clip.thisUId")
