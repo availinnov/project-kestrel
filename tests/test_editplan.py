@@ -10,7 +10,7 @@ import pytest
 
 from kestrel.editplan import ClipEdit, parse_plan_json, snap_boundary, trimmed_range
 from kestrel.project.parser import parse_project
-from kestrel.project.sequence import apply_plan
+from kestrel.project.sequence import apply_plan, build_constant_speed_param
 from kestrel.project.writer import ProjectWriteError
 from tests.test_sequence import fixture, rewrite_fixture
 
@@ -142,6 +142,10 @@ def test_apply(tmp_path: Path, drops: list[int], start: int, end: int) -> None:
                 and clip.out_point == selected["out_point"]
             )
             assert clip.raw["speed"]["offset"] == clip.in_point / 10000000
+            assert clip.raw["speed"]["offsetEnd"] == clip.out_point / 10000000
+            assert clip.raw["speed"]["speedParam"] == build_constant_speed_param(
+                selected["full_out_point"]
+            )
     assert after.duration == previous
     for i in (1, 3):
         assert (
@@ -220,3 +224,24 @@ def test_cli_and_trim_adjustment(tmp_path: Path) -> None:
         }
     ]
     assert report["selected_sources"][0]["in_point"] == 166667
+
+
+def test_same_source_trim_variants_preserve_speed_mapping(tmp_path: Path) -> None:
+    source = fixture(tmp_path)
+    payloads = []
+    for index, (start, end) in enumerate(
+        [(0, 0), (1000000, 0), (0, 1000000), (1000000, 1000000)]
+    ):
+        plan = save_plan(
+            tmp_path,
+            [entry("m0", True, start, end), entry("m1", False), entry("m2", False)],
+        )
+        output = tmp_path / f"variant{index}.zip"
+        apply_plan(source, plan, output)
+        project = parse_project(output)
+        assert project.active_timeline
+        pair = [c for t in project.active_timeline.tracks for c in t.clips]
+        assert len(pair) == 2
+        payloads.extend(c.raw["speed"]["speedParam"] for c in pair)
+    assert len(set(payloads)) == 1
+    assert json.loads(payloads[0])["_totalTime"] == 1.0

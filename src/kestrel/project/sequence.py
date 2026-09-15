@@ -454,7 +454,9 @@ def _build_sequence(
                     "vidStreamInfo" if index == 0 else "audStreamInfo"
                 ][0]["vidStreamId" if index == 0 else "audStreamId"],
             )
-            clip["speed"]["speedParam"] = build_constant_speed_param(item.source_out)
+            clip["speed"]["speedParam"] = build_constant_speed_param(
+                initial_source_range(item.resource, fps)[1]
+            )
             clip["speed"].update(
                 offset=item.source_in / TICKS_PER_SECOND,
                 offsetEnd=item.source_out / TICKS_PER_SECOND,
@@ -742,9 +744,7 @@ def _build_sequence(
                 )
                 if (c.in_point, c.out_point) != expected_range:
                     raise ProjectWriteError("Post-write endpoint mismatch")
-                if c.raw["speed"]["speedParam"] != build_constant_speed_param(
-                    c.out_point
-                ):
+                if c.raw["speed"]["speedParam"] != build_constant_speed_param(full_out):
                     raise ProjectWriteError(
                         "Post-write constant-speed payload mismatch"
                     )
