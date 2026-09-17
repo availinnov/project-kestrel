@@ -21,6 +21,7 @@ from kestrel.project.writer import (
     set_clip_state,
     set_trim,
 )
+from kestrel.rules_evaluation import rules_evaluate
 
 
 def render(result: dict[str, Any]) -> str:
@@ -120,6 +121,12 @@ def main() -> None:
     media_parser.add_argument("--sample-rate", type=float, default=1.0)
     media_parser.add_argument("--black-luma-threshold", type=float, default=0.05)
     media_parser.add_argument("--high-peak-dbfs", type=float, default=-3.0)
+    rules_parser = commands.add_parser(
+        "rules-evaluate", help="Re-evaluate rules over saved analysis signals"
+    )
+    rules_parser.add_argument("analysis")
+    rules_parser.add_argument("rules")
+    rules_parser.add_argument("output")
     dataset_parser = commands.add_parser(
         "dataset-extract", help="Extract source usage and retained fragments"
     )
@@ -183,6 +190,8 @@ def main() -> None:
             result = media_analyze(
                 args.input, args.output, args.rules, ffmpeg=args.ffmpeg, config=config
             )
+        elif args.command == "rules-evaluate":
+            result = rules_evaluate(args.analysis, args.rules, args.output)
         elif args.command == "dataset-extract":
             result = extract_dataset(args.input, args.output)
         elif args.command == "project-apply-plan":

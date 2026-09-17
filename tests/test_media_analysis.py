@@ -21,6 +21,7 @@ from kestrel.media_detectors import (
     sample_times,
     video_measurements,
 )
+from kestrel.rules_evaluation import rules_evaluate
 from tests.test_dataset import dataset_fixture
 from tests.test_sequence import rewrite_fixture
 
@@ -161,6 +162,12 @@ def test_pipeline(tmp_path: Path, monkeypatch: Any) -> None:
     )
     assert data["sources"][0]["actions"][0]["rule_id"] == "drop_short_clip"
     assert data["sources"][1]["actions"][0]["rule_id"] == "drop_mostly_black"
+    reevaluated = tmp_path / "reevaluated.json"
+    rules_evaluate(output, "rules/default_rules_v1.json", reevaluated)
+    reevaluated_data = json.loads(reevaluated.read_text())
+    assert [source["actions"] for source in reevaluated_data["sources"]] == [
+        source["actions"] for source in data["sources"]
+    ]
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
     with pytest.raises(ValueError):
         media_analyze(source, source)

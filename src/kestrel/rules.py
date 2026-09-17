@@ -3,7 +3,10 @@
 import json
 import math
 import operator
+from collections import Counter
 from typing import Any
+
+ACTION_TYPES = ("drop", "normalize_audio", "color_tag", "warning")
 
 OPS = {
     "<": operator.lt,
@@ -158,3 +161,32 @@ def evaluate_rules(
                 actions.append(action)
                 seen.add(key)
     return actions
+
+
+def evaluate_source_rules(
+    sources: list[dict[str, Any]], rules: list[dict[str, Any]]
+) -> None:
+    """Replace source actions using the shared declarative rule engine."""
+    for source in sources:
+        source["actions"] = evaluate_rules(rules, source["signals"])
+
+
+def action_statistics(sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize deterministic actions without re-evaluating conditions."""
+    rule_counts: Counter[str] = Counter()
+    type_counts: Counter[str] = Counter()
+    for source in sources:
+        matched_rules: set[str] = set()
+        for action in source["actions"]:
+            action_type = action.get("type")
+            rule_id = action.get("rule_id")
+            if isinstance(action_type, str):
+                type_counts[action_type] += 1
+            if isinstance(rule_id, str) and rule_id not in matched_rules:
+                rule_counts[rule_id] += 1
+                matched_rules.add(rule_id)
+    return {
+        "rule_match_counts": dict(rule_counts),
+        "action_type_counts": {kind: type_counts[kind] for kind in ACTION_TYPES},
+        "action_count": sum(type_counts.values()),
+    }

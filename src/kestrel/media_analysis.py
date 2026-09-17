@@ -20,7 +20,12 @@ from kestrel.media_detectors import (
 )
 from kestrel.project.models import RawObject
 from kestrel.project.parser import ProjectParseError
-from kestrel.rules import evaluate_rules, lookup, parse_rules
+from kestrel.rules import (
+    action_statistics,
+    evaluate_source_rules,
+    lookup,
+    parse_rules,
+)
 
 
 def analyze_source(
@@ -156,9 +161,10 @@ def media_analyze(
                     filename=filename,
                     source_duration_ticks=ticks,
                     **analysis,
-                    actions=evaluate_rules(rules, analysis["signals"]),
+                    actions=[],
                 )
             )
+        evaluate_source_rules(sources, rules)
         statuses = Counter(s["analysis_status"] for s in sources)
         measured = sum(
             s["signals"]["video"] is not None
@@ -186,11 +192,7 @@ def media_analyze(
             distributions[path] = distribution(
                 [v for v in values if type(v) in (int, float)]
             )
-        counts = Counter(
-            a["rule_id"]
-            for s in sources
-            for a in {a["rule_id"]: a for a in s["actions"]}.values()
-        )
+        counts = action_statistics(sources)["rule_match_counts"]
         black = [lookup(s["signals"], "video.black_frame_ratio") for s in sources]
         duration_values = [s["signals"]["duration_seconds"] for s in sources]
         report = dict(
@@ -208,9 +210,13 @@ def media_analyze(
             audio_analyzed_count=sum(
                 s["signals"]["audio"]["available"] is True for s in sources
             ),
-            proposed_quiet_normalization_count=counts["normalize_quiet_audio"],
-            proposed_loud_normalization_count=counts["normalize_loud_audio"],
-            proposed_short_peak_review_count=counts["mark_audio_peaks"],
+            proposed_quiet_normalization_count=counts.get(
+                "normalize_quiet_audio", 0
+            ),
+            proposed_loud_normalization_count=counts.get(
+                "normalize_loud_audio", 0
+            ),
+            proposed_short_peak_review_count=counts.get("mark_audio_peaks", 0),
             rule_match_counts=dict(counts),
             distributions=distributions,
             decoder_available=executable is not None,
