@@ -105,7 +105,10 @@ def rules_evaluate(
                     "normalize_loud_audio", 0
                 ),
                 "proposed_short_peak_review_count": rule_counts.get(
-                    "mark_audio_peaks", 0
+                    "review_short_loud_event", 0
+                ),
+                "proposed_short_loud_event_review_count": rule_counts.get(
+                    "review_short_loud_event", 0
                 ),
             }
             for field, value in summary_updates.items():

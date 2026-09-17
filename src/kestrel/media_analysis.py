@@ -28,6 +28,14 @@ from kestrel.rules import (
 )
 
 
+def source_basename(filename: str) -> str:
+    """Return a display/filter basename, including for invalid media locations."""
+    try:
+        return local_media_path(filename).name
+    except ValueError:
+        return filename.replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def analyze_source(
     filename: str,
     ticks: Any,
@@ -113,14 +121,25 @@ def media_analyze(
     *,
     ffmpeg: str = "ffmpeg",
     config: DetectorConfig | None = None,
+    filenames: list[str] | None = None,
+    report_path: str | Path | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     config = config or DetectorConfig()
     source, output = Path(source), Path(output)
+    report_output = Path(report_path) if report_path is not None else None
     if output.exists() or output.resolve() == source.resolve():
         raise ProjectParseError(
             "Analysis output must be a new file distinct from input"
         )
+    if report_output is not None:
+        forbidden = {source.resolve(), output.resolve()}
+        if rules_path is not None:
+            forbidden.add(Path(rules_path).resolve())
+        if report_output.exists() or report_output.resolve() in forbidden:
+            raise ProjectParseError(
+                "Analysis report must be a new file distinct from inputs and output"
+            )
     try:
         rules = (
             parse_rules(Path(rules_path).read_text(encoding="utf-8-sig"))
@@ -134,6 +153,8 @@ def media_analyze(
         if isinstance(catalog, RawObject) and len(catalog.pairs) != len(catalog):
             raise ValueError("Duplicate catalog IDs")
         executable = shutil.which(ffmpeg)
+        requested = {name.casefold(): name for name in filenames or []}
+        matched: set[str] = set()
         sources = []
         for identifier, media in sorted(catalog.items()):
             if media.get("media_type") != 8:
@@ -149,6 +170,11 @@ def media_analyze(
             filename = media.get("download_url")
             if not isinstance(filename, str):
                 continue
+            basename = source_basename(filename)
+            filename_key = basename.casefold()
+            if requested and filename_key not in requested:
+                continue
+            matched.add(filename_key)
             ticks = info.get("basicInfo", {}).get(
                 "mediaLength", media.get("media_length")
             )
@@ -163,6 +189,11 @@ def media_analyze(
                     **analysis,
                     actions=[],
                 )
+            )
+        missing = [name for key, name in requested.items() if key not in matched]
+        if missing:
+            raise ValueError(
+                f"Requested filenames were not found: {', '.join(missing)}"
             )
         evaluate_source_rules(sources, rules)
         statuses = Counter(s["analysis_status"] for s in sources)
@@ -187,6 +218,11 @@ def media_analyze(
             "audio.rms_dbfs",
             "audio.integrated_lufs",
             "audio.peak_dbfs",
+            "audio.window_rms_median_dbfs",
+            "audio.window_rms_max_dbfs",
+            "audio.max_rms_above_median_db",
+            "audio.relative_loud_window_ratio",
+            "audio.short_relative_loud_event_ratio",
         ):
             values = [lookup(s["signals"], path) for s in sources]
             distributions[path] = distribution(
@@ -210,13 +246,12 @@ def media_analyze(
             audio_analyzed_count=sum(
                 s["signals"]["audio"]["available"] is True for s in sources
             ),
-            proposed_quiet_normalization_count=counts.get(
-                "normalize_quiet_audio", 0
+            proposed_quiet_normalization_count=counts.get("normalize_quiet_audio", 0),
+            proposed_loud_normalization_count=counts.get("normalize_loud_audio", 0),
+            proposed_short_peak_review_count=counts.get("review_short_loud_event", 0),
+            proposed_short_loud_event_review_count=counts.get(
+                "review_short_loud_event", 0
             ),
-            proposed_loud_normalization_count=counts.get(
-                "normalize_loud_audio", 0
-            ),
-            proposed_short_peak_review_count=counts.get("mark_audio_peaks", 0),
             rule_match_counts=dict(counts),
             distributions=distributions,
             decoder_available=executable is not None,
@@ -235,13 +270,69 @@ def media_analyze(
                     "Number and fraction of fixed windows whose sample peak "
                     "reaches configured dBFS threshold"
                 ),
+                relative_loud=(
+                    "Finite non-silent window RMS values define the median baseline; "
+                    "counts and ratios use all decoded windows"
+                ),
+                relative_loud_events=(
+                    "Adjacent relative-loud windows form one event; short-event ratio "
+                    "is short-event sample duration divided by decoded sample duration"
+                ),
             ),
             sources=sources,
             summary=report,
         )
+        if requested:
+            dataset["selection"] = {"filenames": [requested[key] for key in requested]}
         with output.open("x", encoding="utf-8") as stream:
             json.dump(dataset, stream, indent=2, ensure_ascii=False, allow_nan=False)
         report["output_bytes"] = output.stat().st_size
+        if report_output is not None:
+            details = []
+            fields = (
+                "rms_dbfs",
+                "peak_dbfs",
+                "window_rms_median_dbfs",
+                "window_rms_p90_dbfs",
+                "window_rms_p95_dbfs",
+                "window_rms_max_dbfs",
+                "max_rms_above_median_db",
+                "relative_loud_window_count",
+                "relative_loud_window_ratio",
+                "relative_loud_event_count",
+                "max_relative_loud_event_seconds",
+                "short_relative_loud_event_count",
+                "short_relative_loud_event_ratio",
+            )
+            for item in sources:
+                audio = item["signals"]["audio"]
+                details.append(
+                    {
+                        "catalog_id": item["catalog_id"],
+                        "filename": source_basename(item["filename"]),
+                        "duration": item["signals"]["duration_seconds"],
+                        **{field: audio.get(field) for field in fields},
+                        "actions": item["actions"],
+                    }
+                )
+            detail_report = {
+                "version": 1,
+                "analysis_source": str(output),
+                "detector_config": asdict(config),
+                "source_count": len(details),
+                "runtime_seconds": report["total_runtime_seconds"],
+                "sources": details,
+            }
+            with report_output.open("x", encoding="utf-8") as stream:
+                json.dump(
+                    detail_report,
+                    stream,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            report["report"] = str(report_output)
+            report["report_bytes"] = report_output.stat().st_size
         return report
     except (ValueError, KeyError, TypeError) as error:
         raise ProjectParseError(str(error)) from error

@@ -44,43 +44,33 @@
       }
     },
     {
-      "rule_id": "mark_audio_peaks",
+      "rule_id": "review_short_loud_event",
       "enabled": true,
       "mode": "review",
       "priority": 40,
       "when": {
         "all": [
           {
-            "signal": "audio.rms_dbfs",
-            "op": ">=",
-            "value": -30
-          },
-          {
-            "signal": "audio.rms_dbfs",
-            "op": "<=",
-            "value": -12
-          },
-          {
-            "signal": "audio.high_peak_count",
+            "signal": "audio.short_relative_loud_event_count",
             "op": ">=",
             "value": 1
           },
           {
-            "signal": "audio.high_peak_ratio",
-            "op": "<=",
-            "value": 0.1
+            "signal": "audio.max_rms_above_median_db",
+            "op": ">=",
+            "value": 12
           }
         ]
       },
       "then": {
         "color_tag": 4,
-        "warning": "short_loud_audio_peaks"
+        "warning": "short_loud_audio_event"
       }
     },
     {
       "rule_id": "normalize_quiet_audio",
       "enabled": true,
-      "mode": "auto",
+      "mode": "review",
       "priority": 20,
       "when": {
         "any": [
@@ -105,7 +95,7 @@
     {
       "rule_id": "normalize_loud_audio",
       "enabled": true,
-      "mode": "auto",
+      "mode": "review",
       "priority": 20,
       "when": {
         "signal": "audio.rms_dbfs",

@@ -86,6 +86,69 @@ def test_short_spike() -> None:
     assert result["peak_dbfs"] > -3
 
 
+def _windowed_audio(
+    amplitudes: list[int], config: DetectorConfig | None = None
+) -> dict[str, Any]:
+    stats = AudioAccumulator(config or DetectorConfig())
+    for amplitude in amplitudes:
+        stats.add(array.array("h", [amplitude] * 1600).tobytes())
+    return stats.result()
+
+
+@pytest.mark.parametrize("amplitude", [300, 20_000])
+def test_constant_audio_has_no_relative_event(amplitude: int) -> None:
+    result = _windowed_audio([amplitude] * 20)
+    assert result["max_rms_above_median_db"] == pytest.approx(0)
+    assert result["relative_loud_event_count"] == 0
+    assert result["short_relative_loud_event_count"] == 0
+
+
+def test_one_short_relative_loud_event() -> None:
+    result = _windowed_audio([300] * 10 + [6000] * 2 + [300] * 10)
+    assert result["relative_loud_window_count"] == 2
+    assert result["relative_loud_event_count"] == 1
+    assert result["max_relative_loud_event_seconds"] == pytest.approx(0.2)
+    assert result["short_relative_loud_event_count"] == 1
+    assert result["short_relative_loud_event_ratio"] == pytest.approx(2 / 22)
+    assert result["max_rms_above_median_db"] > 12
+
+
+def test_two_separated_relative_loud_events() -> None:
+    result = _windowed_audio([300] * 10 + [6000, 300, 6000] + [300] * 10)
+    assert result["relative_loud_event_count"] == 2
+    assert result["short_relative_loud_event_count"] == 2
+
+
+def test_long_relative_loud_event_is_not_short() -> None:
+    result = _windowed_audio([300] * 20 + [6000] * 11 + [300] * 20)
+    assert result["relative_loud_event_count"] == 1
+    assert result["max_relative_loud_event_seconds"] == pytest.approx(1.1)
+    assert result["short_relative_loud_event_count"] == 0
+    assert result["short_relative_loud_event_ratio"] == 0
+
+
+def test_silence_and_very_short_audio() -> None:
+    silence = _windowed_audio([0] * 5)
+    assert silence["silent"] is True
+    assert silence["window_rms_median_dbfs"] is None
+    assert silence["max_rms_above_median_db"] is None
+    assert silence["relative_loud_window_count"] == 0
+    assert silence["relative_loud_event_count"] == 0
+    short = AudioAccumulator(DetectorConfig())
+    short.add(array.array("h", [100] * 10).tobytes())
+    assert short.result()["window_count"] == 1
+
+
+def test_audio_windows_do_not_depend_on_decode_chunk_boundaries() -> None:
+    pcm = array.array("h", [300] * 1600 + [6000] * 1600).tobytes()
+    whole = AudioAccumulator(DetectorConfig())
+    whole.add(pcm)
+    fragmented = AudioAccumulator(DetectorConfig())
+    for start in range(0, len(pcm), 777):
+        fragmented.add(pcm[start : start + 777])
+    assert fragmented.result() == whole.result()
+
+
 def test_source_failures(tmp_path: Path, monkeypatch: Any) -> None:
     path = tmp_path / "media.mp4"
     path.write_bytes(b"synthetic")
@@ -171,6 +234,23 @@ def test_pipeline(tmp_path: Path, monkeypatch: Any) -> None:
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
     with pytest.raises(ValueError):
         media_analyze(source, source)
+
+    focused = tmp_path / "focused.json"
+    detail_report = tmp_path / "focused-report.json"
+    focused_summary = media_analyze(
+        source,
+        focused,
+        "rules/default_rules_v1.json",
+        filenames=["1.mp4"],
+        report_path=detail_report,
+    )
+    focused_data = json.loads(focused.read_text())
+    details = json.loads(detail_report.read_text())
+    assert focused_summary["source_count"] == 1
+    assert focused_data["selection"] == {"filenames": ["1.mp4"]}
+    assert focused_data["sources"][0]["filename"].endswith("1.mp4")
+    assert details["source_count"] == 1
+    assert details["sources"][0]["filename"] == "1.mp4"
 
 
 def test_cli_analysis_only(tmp_path: Path) -> None:

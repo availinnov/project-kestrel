@@ -121,6 +121,14 @@ def main() -> None:
     media_parser.add_argument("--sample-rate", type=float, default=1.0)
     media_parser.add_argument("--black-luma-threshold", type=float, default=0.05)
     media_parser.add_argument("--high-peak-dbfs", type=float, default=-3.0)
+    media_parser.add_argument("--relative-loud-window-db", type=float, default=12.0)
+    media_parser.add_argument("--short-loud-event-max-seconds", type=float, default=1.0)
+    media_parser.add_argument(
+        "--filename",
+        action="append",
+        help="Analyze only this source basename; may be repeated",
+    )
+    media_parser.add_argument("--report", help="Write per-source measurement report")
     rules_parser = commands.add_parser(
         "rules-evaluate", help="Re-evaluate rules over saved analysis signals"
     )
@@ -184,11 +192,19 @@ def main() -> None:
                     sample_rate=args.sample_rate,
                     black_luma_threshold=args.black_luma_threshold,
                     high_peak_dbfs=args.high_peak_dbfs,
+                    relative_loud_window_db=args.relative_loud_window_db,
+                    short_loud_event_max_seconds=args.short_loud_event_max_seconds,
                 )
             except ValueError as error:
                 raise ProjectParseError(str(error)) from error
             result = media_analyze(
-                args.input, args.output, args.rules, ffmpeg=args.ffmpeg, config=config
+                args.input,
+                args.output,
+                args.rules,
+                ffmpeg=args.ffmpeg,
+                config=config,
+                filenames=args.filename,
+                report_path=args.report,
             )
         elif args.command == "rules-evaluate":
             result = rules_evaluate(args.analysis, args.rules, args.output)

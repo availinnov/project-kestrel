@@ -60,6 +60,14 @@ def test_groups_priority_disabled_and_dedup() -> None:
     assert evaluate_rules(parse([rule()]), {"video": {"value": True}}) == []
 
 
+def test_new_relative_audio_signal_uses_dotted_lookup() -> None:
+    item = rule(">=", 1)
+    item["when"]["signal"] = "audio.short_relative_loud_event_count"
+    assert evaluate_rules(
+        parse([item]), {"audio": {"short_relative_loud_event_count": 1}}
+    )
+
+
 @pytest.mark.parametrize(
     "change",
     [

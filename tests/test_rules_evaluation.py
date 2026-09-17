@@ -80,7 +80,7 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path, dict[str, Any]]:
         "rules": [
             _rule(
                 "missing",
-                "audio.integrated_lufs",
+                "audio.short_relative_loud_event_count",
                 "!=",
                 -18,
                 {"warning": "missing"},
