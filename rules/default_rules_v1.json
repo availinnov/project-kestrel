@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "rule_id": "drop_short_clip",
+      "enabled": true,
+      "mode": "auto",
+      "priority": 100,
+      "when": {
+        "signal": "duration_seconds",
+        "op": "<",
+        "value": 2
+      },
+      "then": {
+        "drop": true
+      }
+    },
+    {
+      "rule_id": "drop_mostly_black",
+      "enabled": true,
+      "mode": "auto",
+      "priority": 90,
+      "when": {
+        "signal": "video.black_frame_ratio",
+        "op": ">",
+        "value": 0.5
+      },
+      "then": {
+        "drop": true
+      }
+    },
+    {
+      "rule_id": "review_long_clip",
+      "enabled": true,
+      "mode": "review",
+      "priority": 50,
+      "when": {
+        "signal": "duration_seconds",
+        "op": ">=",
+        "value": 20
+      },
+      "then": {
+        "color_tag": 2
+      }
+    },
+    {
+      "rule_id": "mark_audio_peaks",
+      "enabled": true,
+      "mode": "review",
+      "priority": 40,
+      "when": {
+        "all": [
+          {
+            "signal": "audio.rms_dbfs",
+            "op": ">=",
+            "value": -30
+          },
+          {
+            "signal": "audio.rms_dbfs",
+            "op": "<=",
+            "value": -12
+          },
+          {
+            "signal": "audio.high_peak_count",
+            "op": ">=",
+            "value": 1
+          },
+          {
+            "signal": "audio.high_peak_ratio",
+            "op": "<=",
+            "value": 0.1
+          }
+        ]
+      },
+      "then": {
+        "color_tag": 4,
+        "warning": "short_loud_audio_peaks"
+      }
+    },
+    {
+      "rule_id": "normalize_quiet_audio",
+      "enabled": true,
+      "mode": "auto",
+      "priority": 20,
+      "when": {
+        "any": [
+          {
+            "signal": "audio.rms_dbfs",
+            "op": "<",
+            "value": -30
+          },
+          {
+            "signal": "audio.silent",
+            "op": "==",
+            "value": true
+          }
+        ]
+      },
+      "then": {
+        "normalize_audio": {
+          "target_lufs": -18
+        }
+      }
+    },
+    {
+      "rule_id": "normalize_loud_audio",
+      "enabled": true,
+      "mode": "auto",
+      "priority": 20,
+      "when": {
+        "signal": "audio.rms_dbfs",
+        "op": ">",
+        "value": -12
+      },
+      "then": {
+        "normalize_audio": {
+          "target_lufs": -18
+        }
+      }
+    }
+  ]
+}

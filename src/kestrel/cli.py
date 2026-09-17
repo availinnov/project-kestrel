@@ -5,8 +5,11 @@ import json
 from importlib.metadata import version
 from typing import Any
 
+from kestrel.dataset import extract_dataset
 from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
+from kestrel.media_analysis import media_analyze
+from kestrel.media_detectors import DetectorConfig
 from kestrel.project import ProjectParseError, parse_project, project_summary
 from kestrel.project.semantic import semantic_diff_files
 from kestrel.project.sequence import apply_plan, build_sequence
@@ -106,6 +109,22 @@ def main() -> None:
     )
     clone_parser.add_argument("input")
     clone_parser.add_argument("output")
+    media_parser = commands.add_parser(
+        "media-analyze", help="Measure source signals and propose rule actions"
+    )
+    media_parser.add_argument("input")
+    media_parser.add_argument("output")
+    media_parser.add_argument("--rules")
+    media_parser.add_argument("--ffmpeg", default="ffmpeg")
+    media_parser.add_argument("--max-frames", type=int, default=24)
+    media_parser.add_argument("--sample-rate", type=float, default=1.0)
+    media_parser.add_argument("--black-luma-threshold", type=float, default=0.05)
+    media_parser.add_argument("--high-peak-dbfs", type=float, default=-3.0)
+    dataset_parser = commands.add_parser(
+        "dataset-extract", help="Extract source usage and retained fragments"
+    )
+    dataset_parser.add_argument("input")
+    dataset_parser.add_argument("output")
     plan_parser = commands.add_parser(
         "project-apply-plan", help="Apply source keep/drop and trim decisions"
     )
@@ -151,6 +170,21 @@ def main() -> None:
             )
         elif args.command == "project-clone-video-track":
             result = clone_video_track(args.input, args.output)
+        elif args.command == "media-analyze":
+            try:
+                config = DetectorConfig(
+                    max_frames=args.max_frames,
+                    sample_rate=args.sample_rate,
+                    black_luma_threshold=args.black_luma_threshold,
+                    high_peak_dbfs=args.high_peak_dbfs,
+                )
+            except ValueError as error:
+                raise ProjectParseError(str(error)) from error
+            result = media_analyze(
+                args.input, args.output, args.rules, ffmpeg=args.ffmpeg, config=config
+            )
+        elif args.command == "dataset-extract":
+            result = extract_dataset(args.input, args.output)
         elif args.command == "project-apply-plan":
             result = apply_plan(args.input, args.plan, args.output)
         elif args.command == "project-build-sequence":
