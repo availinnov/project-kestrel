@@ -5,6 +5,7 @@ import json
 from importlib.metadata import version
 from typing import Any
 
+from kestrel.audio_calibration import audio_calibrate
 from kestrel.dataset import extract_dataset
 from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
@@ -135,6 +136,17 @@ def main() -> None:
     rules_parser.add_argument("analysis")
     rules_parser.add_argument("rules")
     rules_parser.add_argument("output")
+    calibration_parser = commands.add_parser(
+        "audio-calibrate", help="Calibrate source RMS against manual fragment gains"
+    )
+    calibration_parser.add_argument("dataset")
+    calibration_parser.add_argument("analysis")
+    calibration_parser.add_argument("output")
+    calibration_parser.add_argument(
+        "--exclude-filename",
+        action="append",
+        help="Exclude this source basename from calibration; may be repeated",
+    )
     dataset_parser = commands.add_parser(
         "dataset-extract", help="Extract source usage and retained fragments"
     )
@@ -208,6 +220,13 @@ def main() -> None:
             )
         elif args.command == "rules-evaluate":
             result = rules_evaluate(args.analysis, args.rules, args.output)
+        elif args.command == "audio-calibrate":
+            result = audio_calibrate(
+                args.dataset,
+                args.analysis,
+                args.output,
+                exclude_filenames=args.exclude_filename,
+            )
         elif args.command == "dataset-extract":
             result = extract_dataset(args.input, args.output)
         elif args.command == "project-apply-plan":
