@@ -6,6 +6,7 @@ from importlib.metadata import version
 from typing import Any
 
 from kestrel.audio_calibration import audio_calibrate
+from kestrel.audio_gain_evaluation import audio_gain_evaluate
 from kestrel.dataset import extract_dataset
 from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
@@ -147,6 +148,11 @@ def main() -> None:
         action="append",
         help="Exclude this source basename from calibration; may be repeated",
     )
+    gain_evaluate_parser = commands.add_parser(
+        "audio-gain-evaluate", help="Cross-validate deterministic audio gain models"
+    )
+    gain_evaluate_parser.add_argument("calibration")
+    gain_evaluate_parser.add_argument("output")
     dataset_parser = commands.add_parser(
         "dataset-extract", help="Extract source usage and retained fragments"
     )
@@ -227,6 +233,8 @@ def main() -> None:
                 args.output,
                 exclude_filenames=args.exclude_filename,
             )
+        elif args.command == "audio-gain-evaluate":
+            result = audio_gain_evaluate(args.calibration, args.output)
         elif args.command == "dataset-extract":
             result = extract_dataset(args.input, args.output)
         elif args.command == "project-apply-plan":
