@@ -559,6 +559,49 @@ def gain_target(clip: Clip) -> tuple[Raw, list[Raw]] | None:
     return candidates[0] if candidates else None
 
 
+def apply_clip_gain(clip: Clip, db: float) -> None:
+    """Materialize gain on a cloned clip using the verified VolumeGain primitive."""
+    if not math.isfinite(db):
+        raise ProjectWriteError("Gain must be finite")
+    target = gain_target(clip)
+    if target is None:
+        raise ProjectWriteError("Audio template has no gain-capable effect")
+    effect, params = target
+    matches = [p for p in params if p.get("name") == "VolumeGain"]
+    if matches:
+        parameter = matches[0]
+        fx = parameter.get("fxParam", {})
+        if not isinstance(fx, dict):
+            raise ProjectWriteError("Malformed fxParam cannot be replaced safely")
+        parameter["fxParam"] = {**fx, "paramType": 2, "unValue": float(db)}
+    else:
+        effect["paramList"] = [
+            *params,
+            dict(name="VolumeGain", fxParam=dict(paramType=2, unValue=float(db))),
+        ]
+
+
+def apply_clip_color_tag(clip: Raw, color_tag: int) -> None:
+    """Materialize a numeric Filmora tag on a cloned video clip."""
+    if type(color_tag) is not int or not 1 <= color_tag <= 13:
+        raise ProjectWriteError("Color tag must be 1..13")
+    entries = objects(clip.get("userData", []), "userData")
+    matches = [e for e in entries if e.get("key") == 13000]
+    if len(matches) > 1:
+        raise ProjectWriteError("Duplicate color tag entries are ambiguous")
+    payload = dict(
+        key=13000,
+        size=4,
+        data=base64.b64encode(color_tag.to_bytes(4, "little", signed=True)).decode(
+            "ascii"
+        ),
+    )
+    if matches:
+        matches[0].update(payload)
+    else:
+        clip["userData"] = [*entries, payload]
+
+
 def set_audio_gain(source: str | Path, output: str | Path, db: float) -> dict[str, Any]:
     if not math.isfinite(db):
         raise ProjectWriteError("Gain must be finite")

@@ -11,6 +11,9 @@ class ClipEdit:
     keep: bool
     trim_start_ticks: int
     trim_end_ticks: int
+    gain_db: float | None = None
+    color_tag: int | None = None
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

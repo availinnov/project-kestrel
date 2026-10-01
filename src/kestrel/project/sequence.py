@@ -3,7 +3,7 @@
 import base64
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -16,6 +16,8 @@ from kestrel.project.writer import (
     Edit,
     JsonAppend,
     ProjectWriteError,
+    apply_clip_color_tag,
+    apply_clip_gain,
     identity_allocator,
     object_path,
     validate_ordinary_speed_parameter,
@@ -230,7 +232,12 @@ def source_order_key(
 
 
 def _build_sequence(
-    source: str | Path, output: str | Path, count: int, plan: EditPlan | None = None
+    source: str | Path,
+    output: str | Path,
+    count: int,
+    plan: EditPlan | None = None,
+    *,
+    allow_empty: bool = False,
 ) -> dict[str, Any]:
     if type(count) is not int or count < 1:
         raise ProjectWriteError("Count must be a positive integer")
@@ -408,7 +415,7 @@ def _build_sequence(
             )
             begin += end - start
         count = len(layout)
-        if not count:
+        if not count and not allow_empty:
             raise ProjectWriteError("Plan must keep at least one source")
     else:
         if len(eligible) < count:
@@ -417,7 +424,7 @@ def _build_sequence(
                 + ("; " + "; ".join(rejected_sources) if rejected_sources else "")
             )
         layout = sequence_layout(eligible[:count], fps)
-    duration = layout[-1].timeline_end
+    duration = layout[-1].timeline_end if layout else 0
     for track in timeline.tracks:
         if any(track is destination for destination in destinations):
             continue
@@ -590,6 +597,12 @@ def _build_sequence(
                             )
                     raw = json.dumps(data, separators=(",", ":")).encode()
                 entry.update(data=base64.b64encode(raw).decode("ascii"), size=len(raw))
+            if plan is not None:
+                decision = decisions[catalog_id]
+                if index == 0 and decision.color_tag is not None:
+                    apply_clip_color_tag(clip, decision.color_tag)
+                if index == 1 and decision.gain_db is not None:
+                    apply_clip_gain(replace(template, raw=clip), decision.gain_db)
             generated[index].append(clip)
         selected.append(
             dict(
@@ -725,6 +738,20 @@ def _build_sequence(
                     raise ProjectWriteError("Generated clip resource resolution failed")
                 found_pair.append(matches[0])
             for c in found_pair:
+                if plan is not None:
+                    decision = decisions[pair["catalog_id"]]
+                    if (
+                        c.type == 1
+                        and decision.color_tag is not None
+                        and (c.color_tag != decision.color_tag)
+                    ):
+                        raise ProjectWriteError("Post-write color tag mismatch")
+                    if (
+                        c.type == 2
+                        and decision.gain_db is not None
+                        and (c.audio_gain_db != decision.gain_db)
+                    ):
+                        raise ProjectWriteError("Post-write gain mismatch")
                 if (c.in_point, c.out_point, c.begin, c.end) != (
                     pair["in_point"],
                     pair["frame_aligned_out_point"],
@@ -797,6 +824,18 @@ def apply_plan(
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise ProjectWriteError(
             f"Invalid plan or unsupported source structure: {error}"
+        ) from error
+
+
+def materialize_plan(
+    source: str | Path, output: str | Path, plan: EditPlan
+) -> dict[str, Any]:
+    """Materialize caller decisions, including gain/tags, without policy heuristics."""
+    try:
+        return _build_sequence(source, output, 1, plan, allow_empty=True)
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ProjectWriteError(
+            f"Unsupported plan/source structure: {error}"
         ) from error
 
 

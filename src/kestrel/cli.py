@@ -7,6 +7,7 @@ from typing import Any
 
 from kestrel.audio_calibration import audio_calibrate
 from kestrel.audio_gain_evaluation import audio_gain_evaluate
+from kestrel.auto_edit import project_auto_edit
 from kestrel.dataset import extract_dataset
 from kestrel.duplicate_analysis import duplicate_analyze
 from kestrel.duplicate_calibration import duplicate_calibrate
@@ -48,6 +49,12 @@ def main() -> None:
         "--version", action="version", version=f"%(prog)s {version('project-kestrel')}"
     )
     commands = parser.add_subparsers(dest="command")
+    auto_parser = commands.add_parser(
+        "project-auto-edit", help="Prepare an experimental chronological timeline"
+    )
+    auto_parser.add_argument("input")
+    auto_parser.add_argument("output")
+    auto_parser.add_argument("--report")
     inspect_parser = commands.add_parser(
         "inspect", help="Inspect file metadata and structure"
     )
@@ -214,7 +221,9 @@ def main() -> None:
         parser.print_help()
         return
     try:
-        if args.command == "inspect":
+        if args.command == "project-auto-edit":
+            result = project_auto_edit(args.input, args.output, report_path=args.report)
+        elif args.command == "inspect":
             result = inspect_file(args.path)
         elif args.command == "project-summary":
             result = project_summary(parse_project(args.path))
