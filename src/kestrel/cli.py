@@ -9,6 +9,7 @@ from kestrel.audio_calibration import audio_calibrate
 from kestrel.audio_gain_evaluation import audio_gain_evaluate
 from kestrel.dataset import extract_dataset
 from kestrel.duplicate_analysis import duplicate_analyze
+from kestrel.duplicate_calibration import duplicate_calibrate
 from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.media_analysis import media_analyze
@@ -113,6 +114,13 @@ def main() -> None:
     )
     clone_parser.add_argument("input")
     clone_parser.add_argument("output")
+    calibration_duplicate_parser = commands.add_parser(
+        "duplicate-calibrate",
+        help="Explore same-scene rules from saved JSON measurements",
+    )
+    calibration_duplicate_parser.add_argument("analysis")
+    calibration_duplicate_parser.add_argument("review")
+    calibration_duplicate_parser.add_argument("output")
     duplicate_parser = commands.add_parser(
         "duplicate-analyze", help="Measure visual similarity of neighboring sources"
     )
@@ -212,6 +220,8 @@ def main() -> None:
             )
         elif args.command == "project-clone-video-track":
             result = clone_video_track(args.input, args.output)
+        elif args.command == "duplicate-calibrate":
+            result = duplicate_calibrate(args.analysis, args.review, args.output)
         elif args.command == "duplicate-analyze":
             result = duplicate_analyze(
                 args.input,
