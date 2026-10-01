@@ -8,6 +8,7 @@ from typing import Any
 from kestrel.audio_calibration import audio_calibrate
 from kestrel.audio_gain_evaluation import audio_gain_evaluate
 from kestrel.dataset import extract_dataset
+from kestrel.duplicate_analysis import duplicate_analyze
 from kestrel.formats.diff import diff_files
 from kestrel.formats.inspect import inspect_file
 from kestrel.media_analysis import media_analyze
@@ -112,6 +113,14 @@ def main() -> None:
     )
     clone_parser.add_argument("input")
     clone_parser.add_argument("output")
+    duplicate_parser = commands.add_parser(
+        "duplicate-analyze", help="Measure visual similarity of neighboring sources"
+    )
+    duplicate_parser.add_argument("input")
+    duplicate_parser.add_argument("output")
+    duplicate_parser.add_argument("--max-neighbor-distance", type=int, default=2)
+    duplicate_parser.add_argument("--frame-samples", type=int, default=5)
+    duplicate_parser.add_argument("--ffmpeg", default="ffmpeg")
     media_parser = commands.add_parser(
         "media-analyze", help="Measure source signals and propose rule actions"
     )
@@ -203,6 +212,14 @@ def main() -> None:
             )
         elif args.command == "project-clone-video-track":
             result = clone_video_track(args.input, args.output)
+        elif args.command == "duplicate-analyze":
+            result = duplicate_analyze(
+                args.input,
+                args.output,
+                max_neighbor_distance=args.max_neighbor_distance,
+                frame_samples=args.frame_samples,
+                ffmpeg=args.ffmpeg,
+            )
         elif args.command == "media-analyze":
             try:
                 config = DetectorConfig(
