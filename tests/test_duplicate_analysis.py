@@ -153,8 +153,10 @@ def test_offline_evaluation_counts() -> None:
         if t["signal"] == "image_similarity_median" and t["threshold"] == 0.85
     )
     assert threshold["positive_controls_matched"] == 0
-    assert threshold["negative_controls_matched"] == 1
-    assert threshold["false_negative_count"] == 1
+    assert threshold["unlabeled_pairs_matched"] == 1
+    assert threshold["known_positives_missed"] == 1
+    assert "negative_controls_matched" not in threshold
+    assert "provisional_false_positive_count" not in threshold
     assert len(threshold["missed_positive_pairs"]) == 1
     assert result["ungenerated_positive_pairs"] == []
 

@@ -9,7 +9,7 @@ from typing import Any
 def evaluate_controls(
     analysis: dict[str, Any], positive_pairs: list[list[str]]
 ) -> dict[str, Any]:
-    """Treat remaining neighbors as likely-negative controls, not verified labels."""
+    """Evaluate known positives separately from controls without manual labels."""
     positives = {tuple(sorted(pair)) for pair in positive_pairs}
     measured = []
     observed = set()
@@ -21,7 +21,7 @@ def evaluate_controls(
                 dict(
                     pair,
                     evaluation_label=(
-                        "positive" if key in positives else "likely_negative"
+                        "positive" if key in positives else "unlabeled"
                     ),
                 )
             )
@@ -41,17 +41,16 @@ def evaluate_controls(
                 )
             ]
             tp = sum(p["evaluation_label"] == "positive" for p in matched)
-            fp = len(matched) - tp
+            unlabeled_matched = len(matched) - tp
             total_positive = sum(p["evaluation_label"] == "positive" for p in measured)
             thresholds.append(
                 dict(
                     signal=signal,
                     threshold=threshold,
                     positive_controls_matched=tp,
-                    negative_controls_matched=fp,
-                    provisional_false_positive_count=fp,
-                    false_negative_count=total_positive - tp,
-                    matched_likely_negative_pairs=[
+                    known_positives_missed=total_positive - tp,
+                    unlabeled_pairs_matched=unlabeled_matched,
+                    matched_unlabeled_pairs=[
                         p for p in matched if p["evaluation_label"] != "positive"
                     ],
                     missed_positive_pairs=[
@@ -76,8 +75,8 @@ def evaluate_controls(
         )
     return dict(
         **analysis["summary"],
-        evaluation_note="Non-positive neighbors are likely negatives. False positives "
-        "are provisional and require manual review. No production threshold chosen.",
+        evaluation_note="Other neighbors are unlabeled controls, not confirmed "
+        "negatives. No false-positive rate or production threshold is calculated.",
         positive_controls=[p for p in measured if p["evaluation_label"] == "positive"],
         ungenerated_positive_pairs=[list(p) for p in sorted(positives - observed)],
         unmeasured_positive_pairs=[
