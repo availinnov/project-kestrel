@@ -1,5 +1,6 @@
 """Generated control projects for Auto Edit policy and Filmora materialization."""
 
+import base64
 import copy
 import json
 import subprocess
@@ -26,7 +27,7 @@ from kestrel.duplicate_analysis import describe_frame
 from kestrel.duplicate_orb import OrbFrame
 from kestrel.editplan import trimmed_range
 from kestrel.project.parser import parse_project
-from kestrel.project.sequence import build_constant_speed_param
+from kestrel.project.sequence import build_constant_speed_param, materialize_plan
 from kestrel.project.writer import ProjectWriteError
 from tests.test_dataset import dataset_fixture
 from tests.test_duplicate_analysis import image
@@ -93,7 +94,7 @@ def test_review_only_priority_all_reasons(gap: int, inliers: int, tagged: bool) 
     relations = [relation(gap, inliers)]
     plan, decisions = finalize_plan(hard_quality_plan(sources), relations, Fraction(60))
     assert all(edit.keep for edit in plan.clips)
-    assert decisions[0]["color_tag"] == (1 if tagged else 4)
+    assert decisions[0]["color_tag"] == (1 if tagged else 7)
     assert {"short_relative_loud_event", "long_clip_review"} <= set(
         decisions[0]["reasons"]
     )
@@ -346,3 +347,76 @@ def test_publish_cannot_overwrite_existing_output(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         publish_new_file(staged, output)
     assert output.read_bytes() == b"preserve"
+
+
+@pytest.mark.parametrize(
+    ("duration", "same_scene", "expected_tag", "expected_reasons"),
+    [
+        (5, False, 7, {"short_relative_loud_event"}),
+        (5, True, 1, {"short_relative_loud_event", "same_scene_review"}),
+        (25, False, 7, {"short_relative_loud_event", "long_clip_review"}),
+        (
+            25,
+            True,
+            1,
+            {"short_relative_loud_event", "long_clip_review", "same_scene_review"},
+        ),
+    ],
+)
+def test_loud_tag_serialization_and_reason_preservation(
+    tmp_path: Path,
+    duration: float,
+    same_scene: bool,
+    expected_tag: int,
+    expected_reasons: set[str],
+) -> None:
+    input_path = auto_fixture(tmp_path, (duration, 5, 5))
+    sources = [
+        source(f"m{i}", d, loud=1 if i == 0 else 0)
+        for i, d in enumerate((duration, 5, 5))
+    ]
+    relations = (
+        [
+            dict(
+                left=dict(catalog_id="m0"),
+                right=dict(catalog_id="m1"),
+                capture_time_gap_seconds=10,
+                orb_best_inlier_count=10,
+            )
+        ]
+        if same_scene
+        else []
+    )
+    plan, decisions = finalize_plan(hard_quality_plan(sources), relations, Fraction(60))
+    assert set(decisions[0]["reasons"]) == expected_reasons
+    assert set(plan.clips[0].reasons) == expected_reasons
+    assert plan.clips[0].color_tag == expected_tag
+    assert all(item["color_tag"] != 4 for item in decisions)
+    assert all(clip.color_tag != 4 for clip in plan.clips)
+    output = tmp_path / "tagged.wfp"
+    result = materialize_plan(input_path, output, plan)
+    generated = parse_project(output)
+    assert generated.active_timeline
+    assert all(
+        clip.color_tag != 4
+        for track in generated.active_timeline.tracks
+        for clip in track.clips
+    )
+    selected = result["selected_sources"][0]
+    video = next(
+        c
+        for t in generated.active_timeline.tracks
+        for c in t.clips
+        if c.id == selected["video_clip_id"]
+    )
+    entries = [e for e in video.raw["userData"] if e.get("key") == 13000]
+    assert entries == [
+        dict(
+            key=13000,
+            size=4,
+            data=base64.b64encode(
+                expected_tag.to_bytes(4, "little", signed=False)
+            ).decode("ascii"),
+        )
+    ]
+    assert video.color_tag == expected_tag

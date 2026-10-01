@@ -268,7 +268,7 @@ def project_auto_edit(
                 ),
                 tagged_same_scene=sum(s["color_tag"] == 1 for s in decisions),
                 tagged_long=sum(s["color_tag"] == 2 for s in decisions),
-                tagged_short_loud_event=sum(s["color_tag"] == 4 for s in decisions),
+                tagged_short_loud_event=sum(s["color_tag"] == 7 for s in decisions),
                 gain_adjusted=sum(
                     s["keep"] and s["planned_gain_db"] is not None for s in decisions
                 ),

@@ -18,7 +18,7 @@ RELATIVE_LOUD_THRESHOLD_DB = 15.0
 GAIN_BREAKPOINT_DBFS = -41.869214
 TAG_PRIORITY = (
     ("same_scene_review", 1),
-    ("short_relative_loud_event", 4),
+    ("short_relative_loud_event", 7),
     ("long_clip_review", 2),
 )
 POLICY = dict(
