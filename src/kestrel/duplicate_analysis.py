@@ -48,6 +48,31 @@ def neighbor_pairs(count: int, distance: int) -> list[tuple[int, int]]:
     ]
 
 
+def capture_window_pairs(
+    sources: list[dict[str, Any]], max_gap: float = 180
+) -> list[tuple[int, int]]:
+    """Walk the sorted time window; missing capture times cannot form candidates."""
+    if not math.isfinite(max_gap) or max_gap < 0:
+        raise ValueError("Capture gap must be finite and nonnegative")
+    valid = [
+        (i, s["capture_time"])
+        for i, s in enumerate(sources)
+        if type(s.get("capture_time")) in (int, float)
+        and math.isfinite(s["capture_time"])
+        and s["capture_time"] > 0
+    ]
+    if any(a[1] > b[1] for a, b in zip(valid, valid[1:], strict=False)):
+        raise ValueError("Sources must be chronologically ordered")
+    pairs = []
+    for offset, (i, timestamp) in enumerate(valid):
+        for next_offset in range(offset + 1, len(valid)):
+            j, later = valid[next_offset]
+            if later - timestamp > max_gap:
+                break
+            pairs.append((i, j))
+    return pairs
+
+
 def area_means(frame: bytes, width: int, height: int) -> tuple[float, ...]:
     """Deterministic disjoint integer cells covering the entire grayscale frame."""
     if len(frame) != WIDTH * HEIGHT:
@@ -217,15 +242,22 @@ def duplicate_analyze(
     source: str | Path,
     output: str | Path,
     *,
-    max_neighbor_distance: int = 2,
+    max_neighbor_distance: int | None = None,
+    max_capture_gap_seconds: float = 180,
     frame_samples: int = 5,
     ffmpeg: str = "ffmpeg",
 ) -> dict[str, Any]:
     started = time.perf_counter()
     source, output = Path(source), Path(output)
-    if not 1 <= frame_samples <= 16 or max_neighbor_distance < 1:
+    if (
+        not 1 <= frame_samples <= 16
+        or (max_neighbor_distance is not None and max_neighbor_distance < 1)
+        or not math.isfinite(max_capture_gap_seconds)
+        or max_capture_gap_seconds < 0
+    ):
         raise ProjectParseError(
-            "frame-samples must be 1..16; neighbor distance positive"
+            "frame-samples must be 1..16; neighbor distance positive; "
+            "capture gap finite/nonnegative"
         )
     if output.exists() or source.resolve() == output.resolve():
         raise ProjectParseError("Output must be a new file distinct from input")
@@ -274,7 +306,12 @@ def duplicate_analyze(
             sources.append(item)
             cache.append(frames)
         pairs = []
-        for i, j in neighbor_pairs(len(sources), max_neighbor_distance):
+        candidates = (
+            neighbor_pairs(len(sources), max_neighbor_distance)
+            if max_neighbor_distance is not None
+            else capture_window_pairs(sources, max_capture_gap_seconds)
+        )
+        for i, j in candidates:
             a, b = sources[i], sources[j]
             signals = (
                 compare_frames(cache[i], cache[j]) if cache[i] and cache[j] else {}
@@ -302,6 +339,9 @@ def duplicate_analyze(
             pair_count=len(pairs),
             measured_pair_count=sum(p["analysis_status"] == "ok" for p in pairs),
             failed_source_count=sum(not f for f in cache),
+            sources_without_capture_time=sum(
+                s["capture_time"] is None for s in sources
+            ),
             runtime_seconds=time.perf_counter() - started,
         )
         data = dict(
@@ -309,7 +349,12 @@ def duplicate_analyze(
             input=str(source),
             descriptor_definitions=dict(DEFINITIONS, **ORB_DEFINITIONS),
             config=dict(
-                max_neighbor_distance=max_neighbor_distance, frame_samples=frame_samples
+                candidate_policy="legacy_neighbors"
+                if max_neighbor_distance is not None
+                else "capture_time_window",
+                max_neighbor_distance=max_neighbor_distance,
+                frame_samples=frame_samples,
+                max_capture_gap_seconds=max_capture_gap_seconds,
             ),
             summary=summary,
             sources=sources,

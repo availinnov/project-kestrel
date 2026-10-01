@@ -121,12 +121,22 @@ def main() -> None:
     calibration_duplicate_parser.add_argument("analysis")
     calibration_duplicate_parser.add_argument("review")
     calibration_duplicate_parser.add_argument("output")
+    calibration_duplicate_parser.add_argument(
+        "--additional-review",
+        action="append",
+        help="Merge another review queue; repeatable",
+    )
     duplicate_parser = commands.add_parser(
         "duplicate-analyze", help="Measure visual similarity of neighboring sources"
     )
     duplicate_parser.add_argument("input")
     duplicate_parser.add_argument("output")
-    duplicate_parser.add_argument("--max-neighbor-distance", type=int, default=2)
+    duplicate_parser.add_argument(
+        "--max-neighbor-distance",
+        type=int,
+        help="Explicit legacy neighbor mode; replaces capture-time candidates",
+    )
+    duplicate_parser.add_argument("--max-capture-gap-seconds", type=float, default=180)
     duplicate_parser.add_argument("--frame-samples", type=int, default=5)
     duplicate_parser.add_argument("--ffmpeg", default="ffmpeg")
     media_parser = commands.add_parser(
@@ -221,12 +231,18 @@ def main() -> None:
         elif args.command == "project-clone-video-track":
             result = clone_video_track(args.input, args.output)
         elif args.command == "duplicate-calibrate":
-            result = duplicate_calibrate(args.analysis, args.review, args.output)
+            result = duplicate_calibrate(
+                args.analysis,
+                args.review,
+                args.output,
+                additional_review_paths=args.additional_review,
+            )
         elif args.command == "duplicate-analyze":
             result = duplicate_analyze(
                 args.input,
                 args.output,
                 max_neighbor_distance=args.max_neighbor_distance,
+                max_capture_gap_seconds=args.max_capture_gap_seconds,
                 frame_samples=args.frame_samples,
                 ffmpeg=args.ffmpeg,
             )

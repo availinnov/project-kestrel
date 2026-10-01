@@ -5,16 +5,18 @@ import json
 from pathlib import Path
 from typing import Any
 
+from kestrel.duplicate_calibration import canonical_pair, merge_labels, pair_key
+
 
 def evaluate_controls(
     analysis: dict[str, Any], positive_pairs: list[list[str]]
 ) -> dict[str, Any]:
     """Evaluate known positives separately from controls without manual labels."""
-    positives = {tuple(sorted(pair)) for pair in positive_pairs}
+    positives = {canonical_pair(*pair) for pair in positive_pairs}
     measured = []
     observed = set()
     for pair in analysis["pairs"]:
-        key = tuple(sorted((pair["left"]["filename"], pair["right"]["filename"])))
+        key = pair_key(pair)
         observed.add(key)
         if pair["analysis_status"] == "ok":
             measured.append(
@@ -110,18 +112,33 @@ def evaluate_controls(
         unmeasured_positive_pairs=[
             p
             for p in analysis["pairs"]
-            if p["analysis_status"] != "ok"
-            and tuple(sorted((p["left"]["filename"], p["right"]["filename"])))
-            in positives
+            if p["analysis_status"] != "ok" and pair_key(p) in positives
         ],
         rankings=rankings,
         threshold_exploration=thresholds,
     )
 
 
-def write_review_queue(report: dict[str, Any], output: Path) -> None:
+def write_review_queue(
+    report: dict[str, Any],
+    output: Path,
+    *,
+    previous_analysis: dict[str, Any] | None = None,
+    reviewed_pairs: list[dict[str, Any]] | None = None,
+) -> None:
     """Exclusively create a queue; preserve every existing file including labels."""
     candidates = report["unlabeled_controls"]
+    labels, _ = merge_labels([], reviewed_pairs or [])
+    previous_keys = (
+        {pair_key(p) for p in previous_analysis["pairs"]}
+        if previous_analysis is not None
+        else set()
+    )
+    candidates = [
+        p
+        for p in candidates
+        if pair_key(p) not in labels and pair_key(p) not in previous_keys
+    ]
     ordered = sorted(
         candidates,
         key=lambda p: (
@@ -134,7 +151,10 @@ def write_review_queue(report: dict[str, Any], output: Path) -> None:
     queue = dict(
         ranking="orb_best_inlier_count, then good-match ratio, then inlier ratio; "
         "counts prioritize geometric support over ratios from very few matches",
-        pairs=[dict(p, manual_same_scene=None) for p in ordered[:20]],
+        pairs=[
+            dict(p, manual_same_scene=None)
+            for p in (ordered if previous_analysis is not None else ordered[:20])
+        ],
     )
     with output.open("x", encoding="utf-8") as stream:
         json.dump(queue, stream, indent=2, allow_nan=False)
@@ -149,24 +169,78 @@ def main() -> None:
     )
     parser.add_argument("output", type=Path)
     parser.add_argument("--review-queue", type=Path)
+    parser.add_argument(
+        "--previous-analysis",
+        type=Path,
+        help="Queue only newly measured pairs absent from this analysis",
+    )
+    parser.add_argument(
+        "--review-labels",
+        type=Path,
+        action="append",
+        help="Preserve labels from an existing queue; repeatable",
+    )
     args = parser.parse_args()
-    if args.output.exists() or args.output.resolve() in {
-        args.analysis.resolve(),
-        args.labels.resolve(),
-    }:
+    input_paths = {args.analysis.resolve(), args.labels.resolve()}
+    input_paths.update(p.resolve() for p in args.review_labels or [])
+    if args.previous_analysis is not None:
+        input_paths.add(args.previous_analysis.resolve())
+    if args.output.exists() or args.output.resolve() in input_paths:
         parser.error("Output must be a new file distinct from inputs")
+    positives = json.loads(args.labels.read_text(encoding="utf-8"))
+    reviewed = [
+        p
+        for path in args.review_labels or []
+        for p in json.loads(path.read_text(encoding="utf-8"))["pairs"]
+    ]
+    merged, counts = merge_labels(positives, reviewed)
     report = evaluate_controls(
         json.loads(args.analysis.read_text(encoding="utf-8")),
-        json.loads(args.labels.read_text(encoding="utf-8")),
+        positives,
     )
+    report["preserved_review_label_summary"] = counts
+    report["preserved_review_labels"] = [
+        dict(pair=list(key), **value) for key, value in sorted(merged.items())
+    ]
+    if args.previous_analysis is not None:
+        previous = json.loads(args.previous_analysis.read_text(encoding="utf-8"))
+        previous_keys = {pair_key(p) for p in previous["pairs"]}
+        analysis = json.loads(args.analysis.read_text(encoding="utf-8"))
+        newly_measured = [
+            p for p in analysis["pairs"] if pair_key(p) not in previous_keys
+        ]
+        report["measurement_coverage"] = dict(
+            previously_measured_candidate_pair_count=len(analysis["pairs"])
+            - len(newly_measured),
+            newly_measured_pair_count=len(newly_measured),
+            newly_measured_pairs=[
+                dict(
+                    p,
+                    signals={
+                        k: v
+                        for k, v in p["signals"].items()
+                        if k != "orb_frame_matches"
+                    },
+                )
+                for p in newly_measured
+            ],
+        )
     if args.review_queue is not None:
-        if args.review_queue.exists() or args.review_queue.resolve() in {
-            args.analysis.resolve(),
-            args.labels.resolve(),
-            args.output.resolve(),
+        if args.review_queue.exists() or args.review_queue.resolve() in input_paths | {
+            args.output.resolve()
         }:
             parser.error("Review queue must be a new file distinct from inputs/output")
-        write_review_queue(report, args.review_queue)
+        previous = (
+            json.loads(args.previous_analysis.read_text(encoding="utf-8"))
+            if args.previous_analysis is not None
+            else None
+        )
+        write_review_queue(
+            report,
+            args.review_queue,
+            previous_analysis=previous,
+            reviewed_pairs=reviewed,
+        )
     args.output.write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )

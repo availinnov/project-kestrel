@@ -510,15 +510,21 @@ def calibrate_data(
 
 
 def duplicate_calibrate(
-    analysis_path: str | Path, review_path: str | Path, output_path: str | Path
+    analysis_path: str | Path,
+    review_path: str | Path,
+    output_path: str | Path,
+    *,
+    additional_review_paths: list[str | Path] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     analysis_path, review_path, output = map(
         Path, (analysis_path, review_path, output_path)
     )
+    additional = [Path(p) for p in additional_review_paths or []]
     if output.exists() or output.resolve() in {
         analysis_path.resolve(),
         review_path.resolve(),
+        *(p.resolve() for p in additional),
     }:
         raise ProjectParseError("Output must be a new file distinct from JSON inputs")
     try:
@@ -526,12 +532,21 @@ def duplicate_calibrate(
             analysis_path.read_bytes(),
             review_path.read_bytes(),
         )
-        result = calibrate_data(json.loads(analysis_bytes), json.loads(review_bytes))
+        review = json.loads(review_bytes)
+        extra_inputs = []
+        for path in additional:
+            content = path.read_bytes()
+            review["pairs"].extend(json.loads(content)["pairs"])
+            extra_inputs.append(
+                dict(path=str(path), sha256=hashlib.sha256(content).hexdigest())
+            )
+        result = calibrate_data(json.loads(analysis_bytes), review)
         result["inputs"] = dict(
             analysis=str(analysis_path),
             review=str(review_path),
             analysis_sha256=hashlib.sha256(analysis_bytes).hexdigest(),
             review_sha256=hashlib.sha256(review_bytes).hexdigest(),
+            additional_reviews=extra_inputs,
         )
         result["runtime_seconds"] = time.perf_counter() - started
         with output.open("x", encoding="utf-8") as stream:
