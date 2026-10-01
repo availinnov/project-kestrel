@@ -64,10 +64,16 @@ def test_single_process_seek_strategy(tmp_path: Path, monkeypatch: Any) -> None:
 
     def run(command: list[str], **kwargs: Any) -> Any:
         calls.append(command)
-        return subprocess.CompletedProcess(command, 0, image(1) * 5, b"")
+        small = image(1)
+        packed = b"".join(
+            small[y * WIDTH : (y + 1) * WIDTH] + bytes(160) for y in range(HEIGHT)
+        ) + bytes(320 * 180)
+        return subprocess.CompletedProcess(command, 0, packed * 5, b"")
 
     monkeypatch.setattr("kestrel.duplicate_analysis.subprocess.run", run)
-    assert len(sample_source(str(source), 10, "ffmpeg", 5)) == 5
+    sampled = sample_source(str(source), 10, "ffmpeg", 5)
+    assert len(sampled) == 5
+    assert all(frame.orb is not None for frame in sampled)
     assert len(calls) == 1
     command = calls[0]
     assert [command[i + 1] for i, v in enumerate(command) if v == "-ss"] == [

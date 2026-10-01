@@ -9,8 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from kestrel.audio_calibration import percentile
 from kestrel.dataset import read_dataset_project
+from kestrel.duplicate_orb import (
+    ORB_DEFINITIONS,
+    OrbFrame,
+    compare_orb,
+    describe_orb,
+)
 from kestrel.media_analysis import source_basename
 from kestrel.media_detectors import duration_signal, local_media_path
 from kestrel.project.models import RawObject
@@ -65,6 +73,7 @@ class FrameDescriptor:
     pixels: tuple[float, ...]
     centered: tuple[float, ...]
     norm: float
+    orb: OrbFrame | None = None
 
 
 def describe_frame(frame: bytes) -> FrameDescriptor:
@@ -154,9 +163,13 @@ def sample_source(
         ]
         filters.append(
             f"[{i}:v:0]trim=end_frame=1,setpts=PTS-STARTPTS,"
+            f"split=2[small{i}][large{i}];[small{i}]"
             f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-            f"setsar=1,format=gray[f{i}]"
+            f"setsar=1,format=gray,pad=320:90:0:0[s{i}];"
+            f"[large{i}]scale=320:180:force_original_aspect_ratio=decrease,"
+            f"pad=320:180:(ow-iw)/2:(oh-ih)/2,setsar=1,format=gray[l{i}];"
+            f"[s{i}][l{i}]vstack=inputs=2[f{i}]"
         )
     filters.append(
         "".join(f"[f{i}]" for i in range(count)) + f"concat=n={count}:v=1:a=0[out]"
@@ -179,12 +192,25 @@ def sample_source(
         "pipe:1",
     ]
     result = subprocess.run(command, capture_output=True, check=True, timeout=60)
-    size = WIDTH * HEIGHT
+    size = 320 * 270
     if len(result.stdout) != count * size:
         raise ValueError("Incomplete sampled frames")
-    return [
-        describe_frame(result.stdout[i * size : (i + 1) * size]) for i in range(count)
-    ]
+    frames = []
+    for i in range(count):
+        packed = np.frombuffer(
+            result.stdout[i * size : (i + 1) * size], dtype=np.uint8
+        ).reshape(270, 320)
+        frame = describe_frame(packed[:90, :160].tobytes())
+        frames.append(
+            FrameDescriptor(
+                frame.hash,
+                frame.pixels,
+                frame.centered,
+                frame.norm,
+                describe_orb(packed[90:, :]),
+            )
+        )
+    return frames
 
 
 def duplicate_analyze(
@@ -253,6 +279,11 @@ def duplicate_analyze(
             signals = (
                 compare_frames(cache[i], cache[j]) if cache[i] and cache[j] else {}
             )
+            if cache[i] and cache[j]:
+                left_orb = [f.orb for f in cache[i] if f.orb is not None]
+                right_orb = [f.orb for f in cache[j] if f.orb is not None]
+                if left_orb and right_orb:
+                    signals.update(compare_orb(left_orb, right_orb))
             da, db = a["duration_seconds"], b["duration_seconds"]
             signals["duration_ratio"] = min(da, db) / max(da, db) if da and db else None
             ta, tb = a["capture_time"], b["capture_time"]
@@ -276,7 +307,7 @@ def duplicate_analyze(
         data = dict(
             schema_version=1,
             input=str(source),
-            descriptor_definitions=DEFINITIONS,
+            descriptor_definitions=dict(DEFINITIONS, **ORB_DEFINITIONS),
             config=dict(
                 max_neighbor_distance=max_neighbor_distance, frame_samples=frame_samples
             ),
