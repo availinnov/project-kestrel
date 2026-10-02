@@ -75,11 +75,7 @@ def resource_from_media(
 ) -> Resource:
     info = metadata["sourceInfo"]
     basic = info["basicInfo"]
-    if (
-        metadata["file_name"] != media["download_url"]
-        or basic["mediaLength"] != media["media_length"]
-    ):
-        raise ProjectWriteError("Imported source metadata disagrees with catalog")
+    imported_source_diagnostics(metadata, media)
     raw = copy.deepcopy(template.raw)
     for key in raw:
         if key in basic:
@@ -128,10 +124,74 @@ def resource_from_media(
                 stream[key] = copy.deepcopy(source_streams[0][key])
             elif stream[key] not in (0, 0.0, "", None, False):
                 raise ProjectWriteError(f"Unresolved source stream field: {key}")
-    raw.update(sourceUuid=identifier, filename="file:/" + media["download_url"])
-    return Resource(
-        identifier, template.document, raw["filename"], basic["mediaLength"], raw
+    raw.update(
+        sourceUuid=identifier,
+        filename="file:/" + media["download_url"],
+        mediaLength=media["media_length"],
     )
+    return Resource(
+        identifier, template.document, raw["filename"], media["media_length"], raw
+    )
+
+
+def imported_source_diagnostics(
+    metadata: Raw, media: Raw, catalog_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Validate identity while retaining Filmora's independent source metadata."""
+    if catalog_id is not None and media.get("id") != catalog_id:
+        raise ProjectWriteError("Catalog identity mismatch")
+    path = media.get("download_url")
+    if not isinstance(path, str) or not path:
+        raise ProjectWriteError("Catalog requires a usable source path")
+    duration = media.get("media_length")
+    if type(duration) is not int or duration <= 0:
+        raise ProjectWriteError("Catalog requires a positive integer duration")
+    filename = path.replace("\\", "/").rsplit("/", 1)[-1]
+    warnings = []
+    source_path = metadata.get("file_name")
+    if source_path is not None and source_path != path:
+        if (
+            not isinstance(source_path, str)
+            or source_path.replace("\\", "/").rsplit("/", 1)[-1] != filename
+        ):
+            raise ProjectWriteError(
+                "Imported source/catalog filename identity mismatch"
+            )
+        if not Path(path).is_file():
+            raise ProjectWriteError("Stale source path requires a usable catalog file")
+        warnings.append(
+            dict(
+                code="stale_source_path",
+                filename=filename,
+                catalog_id=catalog_id or media.get("id"),
+                source_value=source_path,
+                catalog_value=path,
+            )
+        )
+    basic = metadata.get("sourceInfo", {}).get("basicInfo", {})
+    source_duration = basic.get("mediaLength")
+    if source_duration is not None and source_duration != duration:
+        warnings.append(
+            dict(
+                code="source_duration_differs_from_catalog",
+                filename=filename,
+                catalog_id=catalog_id or media.get("id"),
+                source_value=source_duration,
+                catalog_value=duration,
+                delta_ticks=source_duration - duration,
+                delta_seconds=(source_duration - duration) / TICKS_PER_SECOND,
+            )
+        )
+    return warnings
+
+
+def catalog_duration_resource(resource: Resource, media: Raw) -> Resource:
+    """Use catalog duration without changing an existing resource in place."""
+    if resource.duration == media["media_length"]:
+        return resource
+    raw = copy.deepcopy(resource.raw)
+    raw["mediaLength"] = media["media_length"]
+    return replace(resource, duration=media["media_length"], raw=raw)
 
 
 @dataclass(frozen=True)
@@ -314,8 +374,12 @@ def _build_sequence(
         catalog["media_items"].items(),
         key=lambda item: source_order_key(project.raw_documents, *item),
     ):
-        if media.get("media_type") != 8 or media.get("id") != catalog_id:
+        if media.get("media_type") != 8:
             continue
+        metadata = project.raw_documents.get(
+            f"ProjectFolder/Medias/{catalog_id}/media.json", {}
+        )
+        imported_source_diagnostics(metadata, media, catalog_id)
         source_path = media.get("download_url")
         if (
             not isinstance(source_path, str)
@@ -331,7 +395,10 @@ def _build_sequence(
         if len(matches) > 1:
             continue
         if matches:
-            resource = matches[0]
+            resource = catalog_duration_resource(matches[0], media)
+            if resource is not matches[0]:
+                resource.id = "pending:" + catalog_id
+                matches = []
         else:
             metadata = project.raw_documents.get(
                 f"ProjectFolder/Medias/{catalog_id}/media.json"

@@ -31,6 +31,8 @@ from kestrel.project.models import RawObject
 from kestrel.project.parser import parse_project
 from kestrel.project.sequence import (
     capture_time,
+    catalog_duration_resource,
+    imported_source_diagnostics,
     initial_source_range,
     materialize_plan,
     resource_from_media,
@@ -95,8 +97,9 @@ def inventory(source: Path) -> tuple[list[dict[str, Any]], Fraction]:
             continue
         if len(matches) > 1:
             raise ProjectWriteError("Ambiguous source resource")
+        warnings = imported_source_diagnostics(metadata, media, identifier)
         resource = (
-            matches[0]
+            catalog_duration_resource(matches[0], media)
             if matches
             else resource_from_media(template, metadata, media, "pending:" + identifier)
         )
@@ -120,6 +123,7 @@ def inventory(source: Path) -> tuple[list[dict[str, Any]], Fraction]:
                 source_duration_ticks=ticks,
                 full_out_ticks=full_out,
                 has_audio=True,
+                warnings=warnings,
             )
         )
         seen_paths.add(path)
@@ -299,6 +303,12 @@ def project_auto_edit(
                 timings_seconds=timings,
                 runtime_seconds=time.perf_counter() - started,
                 summary=summary,
+                warnings=[
+                    warning
+                    for item in decisions
+                    for warning in item["warnings"]
+                    if isinstance(warning, dict)
+                ],
                 sources=decisions,
                 same_scene_relations=relations,
                 materialization=materialization,

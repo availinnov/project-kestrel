@@ -71,7 +71,7 @@ def hard_quality_plan(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
             keep=not reasons,
             drop_reasons=reasons,
             reasons=list(reasons),
-            warnings=[],
+            warnings=list(source.get("warnings", [])),
             planned_gain_db=None,
             applied_gain_db=None,
             color_tag=None,

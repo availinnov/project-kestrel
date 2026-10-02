@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from kestrel.auto_edit import (
+    inventory,
     project_auto_edit,
     publish_new_file,
     same_scene_measurements,
@@ -27,7 +28,11 @@ from kestrel.duplicate_analysis import describe_frame
 from kestrel.duplicate_orb import OrbFrame
 from kestrel.editplan import trimmed_range
 from kestrel.project.parser import parse_project
-from kestrel.project.sequence import build_constant_speed_param, materialize_plan
+from kestrel.project.sequence import (
+    build_constant_speed_param,
+    initial_source_range,
+    materialize_plan,
+)
 from kestrel.project.writer import ProjectWriteError
 from tests.test_dataset import dataset_fixture
 from tests.test_duplicate_analysis import image
@@ -347,6 +352,155 @@ def test_publish_cannot_overwrite_existing_output(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         publish_new_file(staged, output)
     assert output.read_bytes() == b"preserve"
+
+
+@pytest.mark.parametrize("imported", [False, True])
+@pytest.mark.parametrize("delta", [10_000, 220_000, 10_000_000])
+def test_catalog_duration_controls_endpoint_and_speed(
+    tmp_path: Path, monkeypatch: Any, imported: bool, delta: int
+) -> None:
+    path = auto_fixture(tmp_path, (2.9, 5, 3))
+    catalog_ticks = 50_040_000
+    aligned_ticks = 50_000_000
+    source_ticks = catalog_ticks + delta
+
+    def change(docs: Any) -> None:
+        docs["ProjectFolder/Medias/medias_info.json"]["media_items"]["m1"][
+            "media_length"
+        ] = catalog_ticks
+        resources = docs["ProjectFolder/Medias/main/timeline.wesproj"]["resources"]
+        raw = resources[1]
+        raw["mediaLength"] = source_ticks
+        metadata = docs["ProjectFolder/Medias/m1/media.json"]
+        metadata["file_name"] = "synthetic/1.mp4"
+        info = metadata["sourceInfo"]
+        info["basicInfo"].update(mediaLength=source_ticks, streamType=2)
+        info["vidStreamInfos"] = copy.deepcopy(raw["vidStreamInfo"])
+        info["vidStreamInfos"][0]["streamLength"] = catalog_ticks
+        info["audStreamInfos"] = copy.deepcopy(raw["audStreamInfo"])
+        if imported:
+            resources.pop(1)
+
+    rewrite_fixture(path, change)
+    sources, _ = inventory(path)
+    item = next(s for s in sources if s["catalog_id"] == "m1")
+    fps = dict(num=60, den=1)
+    assert item["source_duration_ticks"] == catalog_ticks
+    assert item["full_out_ticks"] == initial_source_range(catalog_ticks, fps)[1]
+    assert (initial_source_range(source_ticks, fps)[1] == item["full_out_ticks"]) is (
+        delta == 10_000
+    )
+    install_signals(monkeypatch)
+    output = tmp_path / "auto.wfp"
+    project_auto_edit(path, output)
+    report = json.loads((tmp_path / "auto_report.json").read_text())
+    assert report["warnings"] == [
+        dict(
+            code="source_duration_differs_from_catalog",
+            filename="1.mp4",
+            catalog_id="m1",
+            source_value=source_ticks,
+            catalog_value=catalog_ticks,
+            delta_ticks=delta,
+            delta_seconds=delta / 10_000_000,
+        )
+    ]
+    selected = next(
+        s
+        for s in report["materialization"]["selected_sources"]
+        if s["catalog_id"] == "m1"
+    )
+    assert selected["full_out_point"] == aligned_ticks
+    assert selected["in_point"] == 5_000_000
+    assert selected["out_point"] == aligned_ticks - 7_000_000
+    updated = parse_project(output)
+    assert updated.active_timeline
+    clips = [
+        c
+        for t in updated.active_timeline.tracks
+        for c in t.clips
+        if c.id in (selected["video_clip_id"], selected["audio_clip_id"])
+    ]
+    for clip in clips:
+        assert clip.resource and clip.resource.duration == catalog_ticks
+        assert clip.raw["speed"]["speedParam"] == build_constant_speed_param(
+            aligned_ticks
+        )
+    with zipfile.ZipFile(path) as original, zipfile.ZipFile(output) as generated:
+        name = "ProjectFolder/Medias/m1/media.json"
+        assert original.read(name) == generated.read(name)
+
+
+@pytest.mark.parametrize("variant", ["stale", "filename", "catalog_id", "missing"])
+@pytest.mark.parametrize("imported", [False, True])
+def test_source_path_identity_and_catalog_authority(
+    tmp_path: Path, monkeypatch: Any, variant: str, imported: bool
+) -> None:
+    path = auto_fixture(tmp_path)
+    catalog_path = "C:/Video/1.mp4"
+    stale_path = "D:/Video/1.mp4"
+    original_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path, "is_file",
+        lambda p: variant != "missing"
+        if p.as_posix() == catalog_path else original_is_file(p),
+    )
+
+    def change(docs: Any) -> None:
+        resources = docs["ProjectFolder/Medias/main/timeline.wesproj"]["resources"]
+        raw = resources[1]
+        raw["filename"] = "file:/" + catalog_path
+        if imported:
+            resources.pop(1)
+        media = docs["ProjectFolder/Medias/medias_info.json"]["media_items"]["m1"]
+        media["download_url"] = catalog_path
+        metadata = docs["ProjectFolder/Medias/m1/media.json"]
+        metadata["file_name"] = stale_path if variant != "filename" else "D:/other.mp4"
+        info = metadata["sourceInfo"]
+        info["basicInfo"]["streamType"] = 2
+        info["vidStreamInfos"] = copy.deepcopy(raw["vidStreamInfo"])
+        info["audStreamInfos"] = copy.deepcopy(raw["audStreamInfo"])
+        if variant == "catalog_id":
+            media["id"] = "wrong"
+
+    rewrite_fixture(path, change)
+    if variant != "stale":
+        with pytest.raises(ProjectWriteError):
+            inventory(path)
+        return
+    sources, _ = inventory(path)
+    item = next(s for s in sources if s["catalog_id"] == "m1")
+    assert item["source_path"] == catalog_path
+    install_signals(monkeypatch)
+    output = tmp_path / "auto.wfp"
+    project_auto_edit(path, output)
+    report = json.loads((tmp_path / "auto_report.json").read_text())
+    assert report["warnings"] == [
+        dict(
+            code="stale_source_path",
+            filename="1.mp4",
+            catalog_id="m1",
+            source_value=stale_path,
+            catalog_value=catalog_path,
+        )
+    ]
+    selected = next(
+        s
+        for s in report["materialization"]["selected_sources"]
+        if s["catalog_id"] == "m1"
+    )
+    updated = parse_project(output)
+    assert updated.active_timeline
+    video = next(
+        c
+        for t in updated.active_timeline.tracks
+        for c in t.clips
+        if c.id == selected["video_clip_id"]
+    )
+    assert video.resource and video.resource.filename == "file:/" + catalog_path
+    with zipfile.ZipFile(output) as archive:
+        metadata = json.loads(archive.read("ProjectFolder/Medias/m1/media.json"))
+        assert metadata["file_name"] == stale_path
 
 
 @pytest.mark.parametrize(
